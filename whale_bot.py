@@ -692,16 +692,41 @@ td{padding:7px 8px;border-bottom:1px solid rgba(24,32,48,.5);color:var(--t)}
   </div>
 </div>
 <script>
+// Password persists across reloads via localStorage
 let PW=localStorage.getItem('wbpw')||'';
 if(PW) document.querySelector('.lock-row').style.display='none';
-function unlock(){PW=document.getElementById('pw').value.trim();localStorage.setItem('wbpw',PW);document.querySelector('.lock-row').style.display='none';load()}
-function h(url,method='GET'){return fetch(url,{method,headers:{'X-Token':PW}}).then(r=>r.json())}
+
+function unlock(){
+  PW=document.getElementById('pw').value.trim();
+  localStorage.setItem('wbpw',PW);
+  document.querySelector('.lock-row').style.display='none';
+  load();
+}
+
+// Allow pressing Enter in password box
+document.getElementById('pw').addEventListener('keydown',function(e){
+  if(e.key==='Enter') unlock();
+});
+
+function h(url,method='GET'){
+  return fetch(url,{method,headers:{'X-Token':PW}}).then(r=>{
+    // If unauthorized, show password box again
+    if(r.status===401){
+      document.querySelector('.lock-row').style.display='flex';
+      alert('Wrong password — please re-enter');
+    }
+    return r.json();
+  });
+}
+
 function showModal(){document.getElementById('modal').classList.add('show')}
 function closeModal(){document.getElementById('modal').classList.remove('show')}
 function doStop(){closeModal();ctrl('estop')}
+
 async function ctrl(a){
   const map={pause:'/api/pause',resume:'/api/resume',estop:'/api/estop'};
-  await h(map[a],'POST');setTimeout(load,400);
+  const res=await h(map[a],'POST');
+  if(res.ok) setTimeout(load,400);
 }
 function fmt(n){const v=parseFloat(n);return(v>=0?'+':'')+`$${Math.abs(v).toFixed(2)}`}
 function fv(n){return `$${parseFloat(n||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`}
@@ -731,12 +756,19 @@ async function load(){
     // Market badge
     const mb=document.getElementById('mbadge');
     mb.className='mbadge '+(d.market_open?'mo':'mc');mb.textContent=d.market_open?'MARKET OPEN':'MARKET CLOSED';
-    // Status
+    // Status — always read from server so reload shows correct state
     const dot=document.getElementById('sdot'),st=document.getElementById('stxt');
     const bp=document.getElementById('bpause'),br=document.getElementById('bresume');
-    if(d.e_stop){dot.className='dot de';st.className='st r';st.textContent='EMERGENCY STOP';bp.disabled=true;br.disabled=false}
-    else if(d.paused){dot.className='dot dp';st.className='st w';st.textContent='PAUSED';bp.disabled=true;br.disabled=false}
-    else{dot.className='dot dr';st.className='st g';st.textContent='RUNNING';bp.disabled=false;br.disabled=true}
+    if(d.e_stop){
+      dot.className='dot de';st.className='st r';st.textContent='EMERGENCY STOP';
+      bp.disabled=true;br.disabled=false;
+    } else if(d.paused){
+      dot.className='dot dp';st.className='st w';st.textContent='PAUSED';
+      bp.disabled=true;br.disabled=false;  // Resume always enabled when paused
+    } else {
+      dot.className='dot dr';st.className='st g';st.textContent='RUNNING';
+      bp.disabled=false;br.disabled=true;  // Pause enabled, Resume disabled when running
+    }
     // Positions
     const pt=document.getElementById('pos-tb');
     if(!d.positions||!d.positions.length){pt.innerHTML='<tr><td colspan="7" class="empty">No open positions</td></tr>'}
