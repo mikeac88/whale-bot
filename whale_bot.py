@@ -320,7 +320,8 @@ def full_scan(label="SCAN"):
     all_t = list(set(TICKERS + news_t))
     if news_t:
         alert(f"📰 Scanning {len(news_t)} extra news tickers: {', '.join(news_t)}", "info")
-    log.info(f"🔍 {label}: scanning {len(all_t)} tickers ({len(TICKERS)} core + {len(news_t)} news)...")
+
+    alert(f"🔍 {label}: scanning {len(all_t)} tickers...", "info")
     ok,chg=market_regime()
     acct=get_account(); cash=float(acct.get("cash",TRADE_SIZE))
     tsize=dynamic_size(cash)
@@ -332,7 +333,18 @@ def full_scan(label="SCAN"):
             if r: setups.append(r)
     setups.sort(key=lambda x:(x["tier"],x["score"]),reverse=True)
     top=setups[:5]
-    log.info(f"✅ {label}: {len(setups)} found → top {len(top)}")
+
+    # Send results to dashboard
+    regime = "✅ BULL" if ok else "⚠️ BEAR"
+    if top:
+        lines = [f"✅ {label} done | {regime} | {len(setups)} setups found"]
+        for i,s in enumerate(top[:3]):
+            w = "🐋" if s["tier"]>=2 else ("🐳" if s["tier"]==1 else "📊")
+            lines.append(f"  #{i+1} {w} {s['sym']} score:{s['score']} {s['chg']:+.1f}% vol:{s['vol']}x")
+        alert("\n".join(lines), "success")
+    else:
+        alert(f"✅ {label} done | {regime} | No setups above score {MIN_SCORE} — watching", "info")
+
     return top,ok,cash
 
 # ─────────────────────────────────────────────────────────────────────────────
