@@ -838,7 +838,6 @@ function tick(){
   document.getElementById('clk').textContent=et+' ET';
 }
 setInterval(tick,1000);tick();
-let lastAlertLen=0;
 async function load(){
   try{
     const d=await h('/api/data');
@@ -879,11 +878,10 @@ async function load(){
     const ot=document.getElementById('ord-tb');
     if(!d.orders||!d.orders.length){ot.innerHTML='<tr><td colspan="5" class="empty">No open orders</td></tr>'}
     else ot.innerHTML=d.orders.map(o=>`<tr><td><b>${o.symbol}</b></td><td class="${o.side==='buy'?'g':'r'}">${o.side?.toUpperCase()}</td><td>${o.qty}</td><td>${(o.type||'').toUpperCase()}</td><td><button class="cbtn" onclick="cancelOrd('${o.id}')">CANCEL</button></td></tr>`).join('');
-    // Alerts
-    if(d.alerts&&d.alerts.length!==lastAlertLen){
-      lastAlertLen=d.alerts.length;
+    // Alerts — always update so new scans always show
+    if(d.alerts && d.alerts.length > 0){
       const lg=document.getElementById('log');
-      lg.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t}</span><span class="lmsg">${a.m}</span></div>`).join('');
+      lg.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t||''}</span><span class="lmsg">${a.m||''}</span></div>`).join('');
     }
   }catch(e){console.error(e)}
 }
