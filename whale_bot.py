@@ -424,9 +424,36 @@ def eod():
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT THREAD
 # ─────────────────────────────────────────────────────────────────────────────
+def keepalive_loop():
+    """Pings own URL every 5 min to prevent Render free tier sleep."""
+    time.sleep(60)  # Wait for server to start
+    url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not url:
+        log.info("No RENDER_EXTERNAL_URL set — keepalive disabled")
+        return
+    while True:
+        try:
+            requests.get(url, timeout=10)
+            log.info("💓 Keepalive ping sent")
+        except Exception as e:
+            log.debug(f"Keepalive error: {e}")
+        time.sleep(270)  # Every 4.5 minutes
+
 def bot_loop():
     alert("🐋 Whale Bot v3 online — pure equity momentum","success")
     alert(f"Scanning {len(TICKERS)} tickers | ${TRADE_SIZE}/trade | Goal: ${DAILY_GOAL}/day","info")
+
+    # ── STARTUP SCAN ──────────────────────────────────────────────────────────
+    # Run immediately on startup if market is open — never miss a session
+    try:
+        clock = aGet("/v2/clock")
+        if clock.get("is_open"):
+            alert("🔄 Bot restarted during market hours — running immediate scan","info")
+            time.sleep(5)  # Brief pause for server to fully start
+            job("STARTUP SCAN")
+    except Exception as e:
+        log.error(f"Startup scan error: {e}")
+
     triggered=set()
     while True:
         try:
@@ -797,6 +824,9 @@ if __name__ == "__main__":
     # Start bot in background thread
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
+    # Start keepalive thread to prevent Render free tier sleep
+    k = threading.Thread(target=keepalive_loop, daemon=True)
+    k.start()
     log.info(f"🖥️  Dashboard on port {PORT}")
     # Run dashboard (Flask in production mode via gunicorn in Render)
     app.run(host="0.0.0.0", port=PORT, threaded=True)
