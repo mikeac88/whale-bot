@@ -811,14 +811,17 @@ document.getElementById('pw').addEventListener('keydown',function(e){
 });
 
 function h(url,method='GET'){
-  return fetch(url,{method,headers:{'X-Token':PW}}).then(r=>{
-    // If unauthorized, show password box again
-    if(r.status===401){
-      document.querySelector('.lock-row').style.display='flex';
-      alert('Wrong password — please re-enter');
-    }
-    return r.json();
-  });
+  return fetch(url,{method,headers:{'X-Token':PW}})
+    .then(r=>{
+      if(r.status===401 && method!=='GET'){
+        window.alert('Wrong password — please re-enter');
+      }
+      return r.json();
+    })
+    .catch(e=>{
+      console.error('Fetch error:',e);
+      return {};
+    });
 }
 
 function showModal(){document.getElementById('modal').classList.add('show')}
@@ -883,11 +886,16 @@ async function load(){
       const lg=document.getElementById('log');
       lg.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t||''}</span><span class="lmsg">${a.m||''}</span></div>`).join('');
     }
-  }catch(e){console.error(e)}
+  }catch(e){
+    console.error('Load error:',e);
+  }
 }
 async function closePos(sym){if(!confirm(`Close position: ${sym}?`))return;await h(`/api/close/${sym}`,'POST');setTimeout(load,500)}
 async function cancelOrd(id){await h(`/api/cancel/${id}`,'POST');setTimeout(load,500)}
-load();setInterval(load,12000);
+
+// Load immediately then every 8 seconds — reliable auto-refresh
+load();
+setInterval(function(){ load(); }, 8000);
 </script></body></html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
