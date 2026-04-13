@@ -65,7 +65,11 @@ TICKERS = list(set(TIER1 + [
 state = {
     "paused":    False,
     "e_stop":    False,
-    "alerts":    [],          # last 60 alerts
+    "alerts":    [],
+    "last_scan": {
+        "time": "", "label": "", "found": 0,
+        "top": [], "healthy": True, "next_in": "",
+    },
     "tracker": {
         "date": str(date.today()),
         "daily_pnl": 0.0, "trades_today": 0,
@@ -325,6 +329,33 @@ def full_scan(label="SCAN"):
             if r: setups.append(r)
     setups.sort(key=lambda x:(x["tier"],x["score"]),reverse=True)
     top=setups[:5]
+
+    # Save scan results to state for dashboard
+    now_str = datetime.now(ET).strftime("%H:%M")
+    top_summary = [
+        {"sym": s["sym"], "score": s["score"], "chg": s["chg"],
+         "vol": s["vol"], "dir": s["dir"], "tier": s["tier"],
+         "price": s["price"]}
+        for s in top
+    ]
+    with state_lock:
+        state["last_scan"]["time"]    = now_str
+        state["last_scan"]["label"]   = label
+        state["last_scan"]["found"]   = len(setups)
+        state["last_scan"]["top"]     = top_summary
+        state["last_scan"]["healthy"] = ok
+
+    # Send scan summary to dashboard alert log
+    regime_str = "✅ BULL" if ok else "⚠️ BEAR"
+    if top:
+        lines = [f"🔍 {label} @ {now_str} | {regime_str} | {len(setups)} setups found"]
+        for i,s in enumerate(top[:3]):
+            whale = "🐋" if s["tier"]>=1 else "📊"
+            lines.append(f"  #{i+1} {whale} {s['sym']} score:{s['score']} move:{s['chg']:+.1f}% vol:{s['vol']}x")
+        alert("\n".join(lines), "info")
+    else:
+        alert(f"🔍 {label} @ {now_str} | {regime_str} | No setups above score {MIN_SCORE} — watching", "info")
+
     log.info(f"✅ {label}: {len(setups)} found → top {len(top)}")
     return top,ok,cash
 
@@ -532,6 +563,7 @@ def api_data():
             "alerts":   alerts[-30:],
             "goal":     DAILY_GOAL,
             "trade_size":TRADE_SIZE,
+            "last_scan": state["last_scan"],
         })
     except Exception as e:
         return jsonify({"error":str(e)}),500
@@ -714,13 +746,17 @@ td{padding:7px 8px;border-bottom:1px solid rgba(24,32,48,.5);color:var(--t)}
       <div class="log" id="log"><div class="li2 ai"><span class="ltime">--:--</span><span class="lmsg">Connecting...</span></div></div>
     </div>
     <div class="card">
-      <div class="ct">Open Orders</div>
-      <table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th></th></tr></thead>
-      <tbody id="ord-tb"><tr><td colspan="5" class="empty">No open orders</td></tr></tbody></table>
+      <div class="ct">Last Scan Summary</div>
+      <div id="scan-summary" style="font-family:var(--m);font-size:11px;color:var(--d)">Waiting for first scan...</div>
     </div>
   </div>
+  <!-- Open Orders -->
+  <div class="card" style="margin-bottom:12px">
+    <div class="ct">Open Orders</div>
+    <table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th></th></tr></thead>
+    <tbody id="ord-tb"><tr><td colspan="5" class="empty">No open orders</td></tr></tbody></table>
+  </div>
 </div>
-<div class="modal" id="modal">
   <div class="mbox">
     <h3>🛑 Emergency Stop?</h3>
     <p>This will <strong>cancel all open orders</strong> and <strong>close all positions</strong> immediately at market price.</p>
@@ -816,8 +852,29 @@ async function load(){
     const ot=document.getElementById('ord-tb');
     if(!d.orders||!d.orders.length){ot.innerHTML='<tr><td colspan="5" class="empty">No open orders</td></tr>'}
     else ot.innerHTML=d.orders.map(o=>`<tr><td><b>${o.symbol}</b></td><td class="${o.side==='buy'?'g':'r'}">${o.side?.toUpperCase()}</td><td>${o.qty}</td><td>${(o.type||'').toUpperCase()}</td><td><button class="cbtn" onclick="cancelOrd('${o.id}')">CANCEL</button></td></tr>`).join('');
-    // Alerts
-    if(d.alerts&&d.alerts.length!==lastAlertLen){
+    // Scan summary
+    const sc = d.last_scan;
+    if(sc && sc.time) {
+      const regime = sc.healthy ? '✅ BULL' : '⚠️ BEAR';
+      let html = `<div style="margin-bottom:8px;color:var(--t)">`;
+      html += `<b>${sc.label}</b> @ ${sc.time} | ${regime}<br>`;
+      html += `<span style="color:var(--d)">${sc.found} setups found</span></div>`;
+      if(sc.top && sc.top.length > 0) {
+        sc.top.forEach((s,i) => {
+          const whale = s.tier >= 2 ? '🐋' : s.tier === 1 ? '🐳' : '📊';
+          const col = parseFloat(s.chg) >= 0 ? 'var(--a)' : 'var(--r)';
+          html += `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--b)">`;
+          html += `<span>${whale} <b style="color:#fff">${s.sym}</b></span>`;
+          html += `<span style="color:${col}">${s.chg > 0 ? '+' : ''}${s.chg}%</span>`;
+          html += `<span style="color:var(--b2)">vol ${s.vol}x</span>`;
+          html += `<span style="color:var(--w)">score ${s.score}</span>`;
+          html += `</div>`;
+        });
+      } else {
+        html += `<div style="color:var(--d);font-size:10px">No setups above minimum score — bot watching and waiting</div>`;
+      }
+      document.getElementById('scan-summary').innerHTML = html;
+    }
       lastAlertLen=d.alerts.length;
       const lg=document.getElementById('log');
       lg.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t}</span><span class="lmsg">${a.m}</span></div>`).join('');
