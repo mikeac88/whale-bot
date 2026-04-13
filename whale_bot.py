@@ -15,7 +15,7 @@ Optional:
 """
 
 import os, json, time, logging, threading, pytz, requests
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, Response, jsonify, request
@@ -66,6 +66,7 @@ state = {
     "paused":    False,
     "e_stop":    False,
     "alerts":    [],          # last 60 alerts
+    "news_tickers": [],       # tickers from recent news — added to scan
     "tracker": {
         "date": str(date.today()),
         "daily_pnl": 0.0, "trades_today": 0,
@@ -313,13 +314,19 @@ def scan_one(sym, spy_chg, healthy, tsize):
         log.debug(f"{sym}: {e}"); return None
 
 def full_scan(label="SCAN"):
-    log.info(f"🔍 {label}: scanning {len(TICKERS)} tickers...")
+    # Combine regular tickers + news tickers
+    with state_lock:
+        news_t = list(state["news_tickers"])
+    all_t = list(set(TICKERS + news_t))
+    if news_t:
+        alert(f"📰 Scanning {len(news_t)} extra news tickers: {', '.join(news_t)}", "info")
+    log.info(f"🔍 {label}: scanning {len(all_t)} tickers ({len(TICKERS)} core + {len(news_t)} news)...")
     ok,chg=market_regime()
     acct=get_account(); cash=float(acct.get("cash",TRADE_SIZE))
     tsize=dynamic_size(cash)
     setups=[]
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs={ex.submit(scan_one,s,chg,ok,tsize):s for s in TICKERS}
+        futs={ex.submit(scan_one,s,chg,ok,tsize):s for s in all_t}
         for f in as_completed(futs):
             r=f.result()
             if r: setups.append(r)
@@ -424,6 +431,43 @@ def eod():
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT THREAD
 # ─────────────────────────────────────────────────────────────────────────────
+def fetch_news_tickers():
+    """
+    Pull latest news from Alpaca and extract hot tickers.
+    Runs every 30 min — adds new symbols to scan list temporarily.
+    """
+    try:
+        # Get last 30 min of news
+        since = (datetime.now(ET) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data  = aGet("/v1beta1/news", params={"start": since, "limit": 50}, base=DATA_URL)
+        news  = data.get("news", [])
+        if not news:
+            return []
+
+        # Extract tickers from news — only ones with multiple mentions (hotter)
+        ticker_count = {}
+        for article in news:
+            syms = article.get("symbols", [])
+            for s in syms:
+                if s and len(s) <= 5 and s.isalpha():  # Valid ticker format
+                    ticker_count[s] = ticker_count.get(s, 0) + 1
+
+        # Only tickers mentioned in 2+ articles = real news flow
+        hot = [t for t, c in ticker_count.items() if c >= 2]
+
+        # Filter out already in watchlist (already being scanned)
+        new_tickers = [t for t in hot if t not in TICKERS][:10]  # Max 10 new
+
+        if new_tickers:
+            alert(f"📰 NEWS: Hot tickers detected — {', '.join(new_tickers)}", "info")
+            with state_lock:
+                state["news_tickers"] = new_tickers
+
+        return new_tickers
+    except Exception as e:
+        log.debug(f"News fetch error: {e}")
+        return []
+
 def keepalive_loop():
     """Pings own URL every 5 min to prevent Render free tier sleep."""
     time.sleep(60)  # Wait for server to start
@@ -469,6 +513,12 @@ def bot_loop():
             }
             if key in schedule and key not in triggered:
                 schedule[key](); triggered.add(key)
+
+            # Fetch news every 30 min during market hours
+            elif 8<=h<16 and m in (0,30) and f"news_{key}" not in triggered:
+                fetch_news_tickers()
+                triggered.add(f"news_{key}")
+
             elif 9<=h<16 and m%2==0 and key not in triggered:
                 monitor()
                 if not is_occupied() and not is_paused():
@@ -480,6 +530,7 @@ def bot_loop():
                 triggered.add(key)
             if h==0 and m==1 and "reset" not in triggered:
                 triggered.clear(); triggered.add("reset")
+                with state_lock: state["news_tickers"]=[]  # Clear news tickers daily
             time.sleep(20)
         except Exception as e:
             log.error(f"Bot error: {e}"); time.sleep(60)
