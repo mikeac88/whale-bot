@@ -773,6 +773,7 @@ if(PW) document.querySelector('.lock-row').style.display='none';
 
 function unlock(){
   PW=document.getElementById('pw').value.trim();
+  if(!PW) return;
   localStorage.setItem('wbpw',PW);
   document.querySelector('.lock-row').style.display='none';
   load();
@@ -785,12 +786,16 @@ document.getElementById('pw').addEventListener('keydown',function(e){
 
 function h(url,method='GET'){
   return fetch(url,{method,headers:{'X-Token':PW}}).then(r=>{
-    // If unauthorized, show password box again
     if(r.status===401){
+      localStorage.removeItem('wbpw');
+      PW='';
       document.querySelector('.lock-row').style.display='flex';
-      alert('Wrong password — please re-enter');
+      window.alert('Wrong password — please re-enter');
     }
     return r.json();
+  }).catch(e=>{
+    console.error('Fetch error:',e);
+    return {};
   });
 }
 
@@ -801,7 +806,7 @@ function doStop(){closeModal();ctrl('estop')}
 async function ctrl(a){
   const map={pause:'/api/pause',resume:'/api/resume',estop:'/api/estop'};
   const res=await h(map[a],'POST');
-  if(res.ok) setTimeout(load,400);
+  if(res && res.ok) setTimeout(load,400);
 }
 function fmt(n){const v=parseFloat(n);return(v>=0?'+':'')+`$${Math.abs(v).toFixed(2)}`}
 function fv(n){return `$${parseFloat(n||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`}
@@ -883,7 +888,8 @@ async function load(){
 }
 async function closePos(sym){if(!confirm(`Close position: ${sym}?`))return;await h(`/api/close/${sym}`,'POST');setTimeout(load,500)}
 async function cancelOrd(id){await h(`/api/cancel/${id}`,'POST');setTimeout(load,500)}
-load();setInterval(load,12000);
+// Only auto-load if password already saved — don't load before unlock
+if(PW){ load(); setInterval(load,12000); }
 </script></body></html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
