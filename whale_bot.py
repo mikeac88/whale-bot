@@ -786,7 +786,7 @@ document.getElementById('pw').addEventListener('keydown',function(e){
 
 function h(url,method='GET'){
   return fetch(url,{method,headers:{'X-Token':PW}}).then(r=>{
-    if(r.status===401){
+    if(r.status===401 && method!=='GET'){
       localStorage.removeItem('wbpw');
       PW='';
       document.querySelector('.lock-row').style.display='flex';
@@ -888,8 +888,8 @@ async function load(){
 }
 async function closePos(sym){if(!confirm(`Close position: ${sym}?`))return;await h(`/api/close/${sym}`,'POST');setTimeout(load,500)}
 async function cancelOrd(id){await h(`/api/cancel/${id}`,'POST');setTimeout(load,500)}
-// Only auto-load if password already saved — don't load before unlock
-if(PW){ load(); setInterval(load,12000); }
+// Always load data — password only needed for controls
+load(); setInterval(load,12000);
 </script></body></html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -905,3 +905,4 @@ if __name__ == "__main__":
     log.info(f"🖥️  Dashboard on port {PORT}")
     # Run dashboard (Flask in production mode via gunicorn in Render)
     app.run(host="0.0.0.0", port=PORT, threaded=True)
+e9 
