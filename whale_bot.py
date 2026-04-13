@@ -489,6 +489,18 @@ def bot_loop():
 # ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
+# Start bot threads at module level so gunicorn starts them too
+_bot_started = False
+def start_bot_threads():
+    global _bot_started
+    if not _bot_started:
+        _bot_started = True
+        threading.Thread(target=bot_loop, daemon=True).start()
+        threading.Thread(target=keepalive_loop, daemon=True).start()
+        log.info("🤖 Bot threads started")
+
+start_bot_threads()
+
 def authed():
     tok=request.headers.get("X-Token") or request.args.get("token","")
     return tok==DASH_PASSWORD
