@@ -715,13 +715,8 @@ def api_data():
             "goal":        DAILY_GOAL,
             "trade_size":  TRADE_SIZE,
         })
-            "goal":        DAILY_GOAL,
-            "trade_size":  TRADE_SIZE,
-        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error":str(e)}),500
 
 @app.route("/api/pause",  methods=["POST"])
 def api_pause():
