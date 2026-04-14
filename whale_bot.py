@@ -30,14 +30,15 @@ DATA_URL      = "https://data.alpaca.markets"
 DASH_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "whale2024")
 PORT          = int(os.environ.get("PORT", 8080))
 
-TRADE_SIZE    = float(os.environ.get("TRADE_SIZE",    "45"))    # $ per trade
-MAX_TRADE     = float(os.environ.get("MAX_TRADE",     "500"))   # max as account grows
-DAILY_GOAL    = float(os.environ.get("DAILY_GOAL",    "100"))   # $100/day target
-MAX_LOSS      = float(os.environ.get("MAX_LOSS",      "50"))    # stop if down $50
-STOP_PCT      = float(os.environ.get("STOP_PCT",      "0.035")) # 3.5% stop loss
+TRADE_SIZE    = float(os.environ.get("TRADE_SIZE",    "45"))
+MAX_TRADE     = float(os.environ.get("MAX_TRADE",     "500"))
+DAILY_GOAL    = float(os.environ.get("DAILY_GOAL",    "100"))
+MAX_LOSS      = float(os.environ.get("MAX_LOSS",      "50"))
+STOP_PCT      = float(os.environ.get("STOP_PCT",      "0.05"))  # 5% stop loss
 TARGET_PCT    = float(os.environ.get("TARGET_PCT",    "0.07"))  # 7% take profit
-MIN_SCORE     = int(os.environ.get("MIN_SCORE",       "55"))    # min signal score
-MAX_DT        = int(os.environ.get("MAX_DAY_TRADES",  "2"))     # day trade limit
+MIN_SCORE     = int(os.environ.get("MIN_SCORE",       "65"))    # raised from 55
+MAX_DT        = int(os.environ.get("MAX_DAY_TRADES",  "2"))
+MIN_PRICE     = float(os.environ.get("MIN_PRICE",     "10.0"))  # skip penny/cheap stocks
 
 ET = pytz.timezone("America/New_York")
 
@@ -63,10 +64,12 @@ TICKERS = list(set(TIER1 + [
 # SHARED STATE — bot and dashboard talk through these
 # ─────────────────────────────────────────────────────────────────────────────
 state = {
-    "paused":    False,
-    "e_stop":    False,
-    "alerts":    [],          # last 60 alerts
-    "news_tickers": [],       # tickers from recent news — added to scan
+    "paused":       False,
+    "e_stop":       False,
+    "alerts":       [],       # last 60 alerts
+    "news_tickers": [],       # tickers from recent news
+    "traded_today": [],       # all tickers traded today
+    "lost_today":   [],       # tickers that hit stop loss today — no re-entry on losers
     "tracker": {
         "date": str(date.today()),
         "daily_pnl": 0.0, "trades_today": 0,
@@ -291,7 +294,7 @@ def scan_one(sym, spy_chg, healthy, tsize):
         if not snap: return None
         d=snap.get("dailyBar",{}); p=snap.get("prevDailyBar",{}); t=snap.get("latestTrade",{})
         cur=t.get("p",d.get("c",0)); pc=p.get("c",0)
-        if cur<2 or pc==0: return None
+        if cur < MIN_PRICE or pc == 0: return None
         dbars=aGet(f"/v2/stocks/{sym}/bars",{"timeframe":"1Day","limit":20,"feed":"iex"},DATA_URL).get("bars",[])
         mbars=aGet(f"/v2/stocks/{sym}/bars",{"timeframe":"1Min","limit":60,"feed":"iex"},DATA_URL).get("bars",[])
         sc,rsns,dir=score_ticker(sym,snap,dbars,mbars,spy_chg,healthy)
@@ -373,46 +376,78 @@ def place(setup, swing=False):
 # ─────────────────────────────────────────────────────────────────────────────
 def execute(setups, healthy, cash, label=""):
     t=tracker()
+
+    # ── Safety checks ─────────────────────────────────────────────────────────
     if t["daily_pnl"] <= -MAX_LOSS:
-        alert(f"🛑 Daily loss limit hit (${t['daily_pnl']:.2f}) — no more trades today","error"); return
+        alert(f"🛑 Daily loss limit (${t['daily_pnl']:.2f}) — done trading today","error"); return
     if t["daily_pnl"] >= DAILY_GOAL:
         alert(f"🎯 Daily goal hit! +${t['daily_pnl']:.2f} — resting","success"); return
     if is_paused():
-        alert("⏸️ Bot paused — skipping execution","warning"); return
+        alert("⏸️ Bot paused — skipping","warning"); return
     if is_occupied():
         log.info("📌 Position open — no new entries"); return
     if cash < TRADE_SIZE:
         alert(f"⚠️ Low cash ${cash:.2f}","warning"); return
     if not setups:
-        alert(f"📊 {label}: No qualifying setups","info"); return
+        return
 
-    # Alert top setups
-    for i,s in enumerate(setups[:3]):
-        tags="🚨EXTREME" if s["tier"]==3 else ("🐋DARK POOL" if s["tier"]==2 else ("🐋WHALE" if s["tier"]==1 else ""))
-        alert(f"#{i+1} {s['dir']} {s['sym']} {tags} | Score:{s['score']} | Move:{s['chg']:+.1f}% | Vol:{s['vol']}x | ${s['cost']:.2f} trade | TP:+${s['pot']:.2f} SL:-${s['risk']:.2f}","info")
+    # ── Get actual day trade count from Alpaca ────────────────────────────────
+    try:
+        acct_dt = int(get_account().get("daytrade_count", 0))
+    except:
+        acct_dt = t["day_trades_used"]
 
-    best=setups[0]; dtr=dt_remaining()
-    required=70 if not healthy else MIN_SCORE
+    # HARD PDT LIMIT — stop at 2 day trades no exceptions
+    if acct_dt >= MAX_DT:
+        alert(f"⚠️ PDT limit reached ({acct_dt} day trades used) — swing trades only","warning")
+
+    # Filter out tickers that already lost today — no throwing good money after bad
+    with state_lock:
+        lost = list(state["lost_today"])
+        traded = list(state["traded_today"])
+    filtered = [s for s in setups if s["sym"] not in lost]
+    if not filtered:
+        alert("📊 All qualifying setups already lost today — no re-entry on losers","info"); return
+
+    best = filtered[0]
+    required = 70 if not healthy else MIN_SCORE
+
+    # Alert best setup
+    tags = "🚨EXTREME" if best["tier"]==3 else ("🐋DARK POOL" if best["tier"]==2 else ("🐋WHALE" if best["tier"]==1 else "📊"))
+    alert(f"{tags} {best['dir']} {best['sym']} | Score:{best['score']} | {best['chg']:+.1f}% | Vol:{best['vol']}x | ${best['cost']:.2f}","info")
 
     if best["tier"]==3:
-        swing=dtr==0
-        alert(f"🚨 EXTREME WHALE — executing {'swing' if swing else 'day trade'}: {best['sym']}","warning")
-        ok,k=place(best,swing=swing)
-        if ok: record(0,k)
-    elif best["score"]>=75 and dtr>0:
-        alert(f"🤖 HIGH SCORE auto-trade: {best['sym']}","info")
-        ok,k=place(best,swing=False)
-        if ok: record(0,k)
-    elif best["score"]>=65 and dtr==0:
-        alert(f"🔄 PDT limit — swing trade: {best['sym']} (hold overnight)","warning")
-        ok,k=place(best,swing=True)
-        if ok: record(0,"swing")
-    elif best["score"]>=required and dtr>0:
-        alert(f"🤖 Auto-trading: {best['sym']} score {best['score']}","info")
-        ok,k=place(best,swing=False)
-        if ok: record(0,k)
+        # Extreme whale — use swing if PDT maxed
+        swing = acct_dt >= MAX_DT
+        alert(f"🚨 EXTREME WHALE — {'SWING' if swing else 'DAY TRADE'}: {best['sym']}","warning")
+        ok,k = place(best, swing=swing)
+        if ok:
+            record(0, k or "day")
+            with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
+
+    elif best["score"] >= 75 and acct_dt < MAX_DT:
+        alert(f"🤖 HIGH SCORE ({best['score']}) — day trading {best['sym']}","info")
+        ok,k = place(best, swing=False)
+        if ok:
+            record(0, "day")
+            with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
+
+    elif best["score"] >= 65 and acct_dt >= MAX_DT:
+        alert(f"🔄 PDT limit — swing trade {best['sym']} (hold overnight)","warning")
+        ok,k = place(best, swing=True)
+        if ok:
+            record(0, "swing")
+            with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
+
+    elif best["score"] >= required and acct_dt < MAX_DT:
+        alert(f"🤖 Auto-trade {best['sym']} score:{best['score']}","info")
+        ok,k = place(best, swing=False)
+        if ok:
+            record(0, "day")
+            with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
+
     else:
-        alert(f"👤 Manual review: {best['sym']} score {best['score']} | Day trades left: {dtr}","warning")
+        alert(f"👤 No action: {best['sym']} score:{best['score']} | DT used:{acct_dt}/{MAX_DT}","warning")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT JOBS
@@ -420,12 +455,49 @@ def execute(setups, healthy, cash, label=""):
 def monitor():
     try:
         for p in get_positions():
-            pl=float(p.get("unrealized_pl",0)); pct=float(p.get("unrealized_plpc",0))*100
-            log.info(f"📊 {p['symbol']} x{p['qty']} @ ${p['current_price']} | P&L: ${pl:+.2f} ({pct:+.1f}%)")
+            pl  = float(p.get("unrealized_pl", 0))
+            pct = float(p.get("unrealized_plpc", 0)) * 100
+            sym = p.get("symbol","")
+            log.info(f"📊 {sym} x{p['qty']} @ ${p['current_price']} | P&L: ${pl:+.2f} ({pct:+.1f}%)")
+            alert(f"📊 {sym} | P&L: ${pl:+.2f} ({pct:+.1f}%)", "info")
     except: pass
+
+def check_closed_trades():
+    """Check for newly closed trades and track wins/losses."""
+    try:
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        fills = aGet("/v2/account/activities/FILL",
+                    params={"date": today, "direction": "desc", "page_size": 20})
+        # Match buy/sell pairs to determine P&L
+        buys  = {}
+        sells = {}
+        for f in fills:
+            sym  = f.get("symbol","")
+            side = f.get("side","")
+            price= float(f.get("price", 0))
+            qty  = float(f.get("qty", 0))
+            if side == "buy":
+                buys[sym]  = buys.get(sym, 0) + price * qty
+            elif side == "sell":
+                sells[sym] = sells.get(sym, 0) + price * qty
+
+        for sym in sells:
+            if sym in buys:
+                pnl = sells[sym] - buys[sym]
+                if pnl < 0:
+                    with state_lock:
+                        if sym not in state["lost_today"]:
+                            state["lost_today"].append(sym)
+                            alert(f"📌 {sym} marked as loser today — no re-entry","warning")
+    except Exception as e:
+        log.debug(f"Trade check error: {e}")
 
 def job(label):
     if is_paused(): alert(f"⏸️ Paused — skipping {label}","warning"); return
+    # No new entries in first 15 min after open (9:30-9:45) — most volatile/fake moves
+    now = datetime.now(ET)
+    if now.hour == 9 and now.minute < 45 and label not in ("PREMARKET 8AM", "OPENING RANGE", "ORB BREAKOUT"):
+        alert("⏳ Waiting for market to settle (9:30-9:45 no-trade window)","info"); return
     s,ok,cash=full_scan(label)
     execute(s,ok,cash,label)
 
@@ -533,6 +605,7 @@ def bot_loop():
 
             elif 9<=h<16 and m%2==0 and key not in triggered:
                 monitor()
+                check_closed_trades()
                 if not is_occupied() and not is_paused():
                     s,ok,cash=full_scan("CONTINUOUS")
                     whales=[x for x in s if x["tier"]>=2]
@@ -542,7 +615,11 @@ def bot_loop():
                 triggered.add(key)
             if h==0 and m==1 and "reset" not in triggered:
                 triggered.clear(); triggered.add("reset")
-                with state_lock: state["news_tickers"]=[]  # Clear news tickers daily
+                with state_lock:
+                    state["news_tickers"]=[]
+                    state["traded_today"]=[]
+                    state["lost_today"]=[]
+                log.info("🔄 New trading day — reset complete")
             time.sleep(20)
         except Exception as e:
             log.error(f"Bot error: {e}"); time.sleep(60)
@@ -568,34 +645,81 @@ def authed():
     tok=request.headers.get("X-Token") or request.args.get("token","")
     return tok==DASH_PASSWORD
 
+# Cache for Alpaca data — refreshes every 15 seconds server-side
+_data_cache = {"ts": None, "data": None}
+_cache_lock  = threading.Lock()
+
+def get_cached_alpaca_data():
+    global _data_cache
+    now = datetime.now(ET)
+    with _cache_lock:
+        if _data_cache["ts"] and (now - _data_cache["ts"]).seconds < 15 and _data_cache["data"]:
+            return _data_cache["data"]
+    # Refresh cache
+    try:
+        acct = get_account()
+        pos  = get_positions()
+        ords = get_orders()
+        clk  = aGet("/v2/clock")
+        data = {"acct": acct, "pos": pos, "ords": ords, "clk": clk}
+        with _cache_lock:
+            _data_cache = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        log.error(f"Cache refresh error: {e}")
+        with _cache_lock:
+            return _data_cache["data"] or {}
+
 @app.route("/")
 def index(): return DASHBOARD_HTML
 
 @app.route("/api/data")
 def api_data():
     try:
-        acct=get_account(); pos=get_positions(); ords=get_orders()
-        t=tracker()
+        cached = get_cached_alpaca_data()
+        acct = cached.get("acct", {})
+        pos  = cached.get("pos",  [])
+        ords = cached.get("ords", [])
+        clk  = cached.get("clk",  {})
+        t    = tracker()
         with state_lock:
-            alerts=list(state["alerts"])
+            alerts  = list(state["alerts"])
+            traded  = list(state["traded_today"])
+            lost    = list(state["lost_today"])
+
+        # Real P&L = equity vs start of day
+        equity     = float(acct.get("equity", 0))
+        last_eq    = float(acct.get("last_equity", 0))
+        real_pnl   = round(equity - last_eq, 2)
+        dt_used    = int(acct.get("daytrade_count", 0))
+
         return jsonify({
-            "equity":   float(acct.get("equity",0)),
-            "cash":     float(acct.get("cash",0)),
-            "pnl":      round(float(acct.get("equity",0))-float(acct.get("last_equity",0)),2),
-            "daily_pnl":t["daily_pnl"],
-            "wins":     t["wins_today"],
-            "losses":   t["losses_today"],
-            "wr":       win_rate(),
-            "dt_used":  int(acct.get("daytrade_count",0)),
-            "paused":   state["paused"],
-            "e_stop":   state["e_stop"],
-            "market_open": aGet("/v2/clock").get("is_open",False),
-            "positions":pos,
-            "orders":   ords,
-            "alerts":   alerts[-30:],
-            "goal":     DAILY_GOAL,
-            "trade_size":TRADE_SIZE,
+            "equity":      equity,
+            "cash":        float(acct.get("cash",0)),
+            "pnl":         real_pnl,
+            "daily_pnl":   real_pnl,   # Use real Alpaca P&L
+            "wins":        t["wins_today"],
+            "losses":      t["losses_today"],
+            "wr":          win_rate(),
+            "dt_used":     dt_used,
+            "dt_max":      MAX_DT,
+            "paused":      state["paused"],
+            "e_stop":      state["e_stop"],
+            "market_open": clk.get("is_open", False),
+            "next_open":   clk.get("next_open", ""),
+            "positions":   pos,
+            "orders":      ords,
+            "alerts":      alerts[-40:],
+            "traded_today":traded,
+            "lost_today":  lost,
+            "goal":        DAILY_GOAL,
+            "trade_size":  TRADE_SIZE,
         })
+            "goal":        DAILY_GOAL,
+            "trade_size":  TRADE_SIZE,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     except Exception as e:
         return jsonify({"error":str(e)}),500
 
@@ -856,7 +980,11 @@ async function load(){
     // Win/loss
     document.getElementById('wl').textContent=`${d.wins||0}W / ${d.losses||0}L`;
     document.getElementById('wr').textContent=`All-time win rate: ${d.wr||0}%`;
-    document.getElementById('dt').textContent=`${d.dt_used||0} / 3`;
+    // Day trades — show real count vs max
+    const dtMax = d.dt_max || 2;
+    const dtEl = document.getElementById('dt');
+    dtEl.textContent = `${d.dt_used||0} / ${dtMax}`;
+    dtEl.className = 'sv ' + ((d.dt_used||0) >= dtMax ? 'r' : 'g');
     // Market badge
     const mb=document.getElementById('mbadge');
     mb.className='mbadge '+(d.market_open?'mo':'mc');mb.textContent=d.market_open?'MARKET OPEN':'MARKET CLOSED';
