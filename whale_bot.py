@@ -80,8 +80,31 @@ state = {
 }
 state_lock = threading.Lock()
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_FILE = "/tmp/whale_bot.log"
+
+# Rotate log file if over 5MB
+def rotate_log():
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
+            # Keep last 1000 lines
+            with open(LOG_FILE, "r") as f:
+                lines = f.readlines()
+            with open(LOG_FILE, "w") as f:
+                f.writelines(lines[-1000:])
+    except Exception:
+        pass
+
+rotate_log()
+
+# Setup logging to BOTH stdout AND file
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, mode='a'),
+    ]
+)
 log = logging.getLogger("whale_bot")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,8 +688,9 @@ def start_bot_threads():
     global _bot_started
     if not _bot_started:
         _bot_started = True
-        threading.Thread(target=bot_loop, daemon=True).start()
-        threading.Thread(target=keepalive_loop, daemon=True).start()
+        threading.Thread(target=bot_loop,          daemon=True).start()
+        threading.Thread(target=keepalive_loop,     daemon=True).start()
+        threading.Thread(target=cache_refresh_loop, daemon=True).start()
         log.info("🤖 Bot threads started")
 
 start_bot_threads()
@@ -675,30 +699,32 @@ def authed():
     tok=request.headers.get("X-Token") or request.args.get("token","")
     return tok==DASH_PASSWORD
 
-# Cache for Alpaca data — refreshes every 15 seconds server-side
-_data_cache = {"ts": None, "data": None}
-_cache_lock  = threading.Lock()
+# Cache for Alpaca data — refreshes in background thread every 10 seconds
+_data_cache = {"ts": None, "data": {
+    "acct": {}, "pos": [], "ords": [], "clk": {}
+}}
+_cache_lock = threading.Lock()
+
+def cache_refresh_loop():
+    """Background thread that keeps Alpaca data fresh — never blocks Flask."""
+    time.sleep(3)  # Brief startup delay
+    while True:
+        try:
+            acct = get_account()
+            pos  = get_positions()
+            ords = get_orders()
+            clk  = aGet("/v2/clock")
+            with _cache_lock:
+                _data_cache["ts"]   = datetime.now(ET)
+                _data_cache["data"] = {"acct": acct, "pos": pos, "ords": ords, "clk": clk}
+        except Exception as e:
+            log.debug(f"Cache refresh error: {e}")
+        time.sleep(10)
 
 def get_cached_alpaca_data():
-    global _data_cache
-    now = datetime.now(ET)
+    """Always returns instantly from cache — never blocks."""
     with _cache_lock:
-        if _data_cache["ts"] and (now - _data_cache["ts"]).seconds < 15 and _data_cache["data"]:
-            return _data_cache["data"]
-    # Refresh cache
-    try:
-        acct = get_account()
-        pos  = get_positions()
-        ords = get_orders()
-        clk  = aGet("/v2/clock")
-        data = {"acct": acct, "pos": pos, "ords": ords, "clk": clk}
-        with _cache_lock:
-            _data_cache = {"ts": now, "data": data}
-        return data
-    except Exception as e:
-        log.error(f"Cache refresh error: {e}")
-        with _cache_lock:
-            return _data_cache["data"] or {}
+        return dict(_data_cache["data"])
 
 @app.route("/")
 def index(): return DASHBOARD_HTML
@@ -773,7 +799,19 @@ def api_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/pause",  methods=["POST"])
+@app.route("/api/logs")
+def api_logs():
+    """Return last 100 lines of bot log — same as Render sees."""
+    try:
+        if not os.path.exists(LOG_FILE):
+            return jsonify({"lines": ["No logs yet..."]})
+        with open(LOG_FILE, "r") as f:
+            lines = f.readlines()
+        # Return last 100 lines, cleaned up
+        recent = [l.strip() for l in lines[-100:] if l.strip()]
+        return jsonify({"lines": recent})
+    except Exception as e:
+        return jsonify({"lines": [f"Log read error: {e}"]})
 def api_pause():
     if not authed(): return jsonify({"error":"Wrong password"}),401
     with state_lock: state["paused"]=True; state["e_stop"]=False
@@ -1079,13 +1117,33 @@ async function load(){
       tl.innerHTML = '<div style="color:var(--d);padding:10px 0;font-size:11px">No trades today</div>';
     }
 
-    // Alerts — always update
-    const lg=document.getElementById('log');
-    if(d.alerts && d.alerts.length > 0){
-      lg.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t||''}</span><span class="lmsg">${a.m||''}</span></div>`).join('');
-    } else {
+    // Live log — reads actual bot log file (same as Render)
+    fetch('/api/logs').then(r=>r.json()).then(d=>{
+      if(d.lines && d.lines.length > 0){
+        const lg=document.getElementById('log');
+        lg.innerHTML = d.lines.slice().reverse().map(line=>{
+          // Color code by content
+          let cls = 'ai';
+          if(line.includes('✅')||line.includes('WIN')||line.includes('profit')) cls='as';
+          else if(line.includes('❌')||line.includes('LOSS')||line.includes('failed')) cls='ae';
+          else if(line.includes('⚠️')||line.includes('PDT')||line.includes('BLOCKED')||line.includes('PAUSED')) cls='aw';
+          else if(line.includes('🐋')||line.includes('WHALE')||line.includes('🚨')) cls='aw';
+          // Extract time from log line
+          const timeMatch = line.match(/[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}/);
+          const t = timeMatch ? timeMatch[0].slice(11) : '';
+          const msg = line.replace(/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} */, '');
+          return `<div class="li2 ${cls}"><span class="ltime">${t}</span><span class="lmsg">${msg}</span></div>`;
+        }).join('');
+      }
+    }).catch(e=>console.error('Log fetch error:',e));
+
+    // Alerts fallback
+    const lg2=document.getElementById('log');
+    if(d.alerts && d.alerts.length > 0 && lg2.children.length <= 1){
+      lg2.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t||''}</span><span class="lmsg">${a.m||''}</span></div>`).join('');
+    } else if(!d.alerts || d.alerts.length === 0){
       const now=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date());
-      lg.innerHTML=`<div class="li2 ai"><span class="ltime">${now}</span><span class="lmsg">Bot running — waiting for market activity...</span></div>`;
+      if(lg2.children.length <= 1) lg2.innerHTML=`<div class="li2 ai"><span class="ltime">${now}</span><span class="lmsg">Bot running — waiting for activity...</span></div>`;
     }
   }catch(e){
     console.error('Load error:',e);
