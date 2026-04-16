@@ -86,7 +86,6 @@ LOG_FILE = "/tmp/whale_bot.log"
 def rotate_log():
     try:
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
-            # Keep last 1000 lines
             with open(LOG_FILE, "r") as f:
                 lines = f.readlines()
             with open(LOG_FILE, "w") as f:
@@ -94,18 +93,36 @@ def rotate_log():
     except Exception:
         pass
 
-rotate_log()
+try:
+    rotate_log()
+except Exception:
+    pass
 
-# Setup logging to BOTH stdout AND file
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, mode='a'),
-    ]
-)
+# Setup logging — add file handler directly (basicConfig is ignored by gunicorn)
+_log_format = logging.Formatter("%(asctime)s %(message)s")
+_handlers = [logging.StreamHandler()]
+try:
+    _file_handler = logging.FileHandler(LOG_FILE, mode='a')
+    _file_handler.setFormatter(_log_format)
+    _handlers.append(_file_handler)
+except Exception:
+    pass  # If file logging fails, stdout still works
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("whale_bot")
+log.setLevel(logging.INFO)
+# Add file handler directly — works even when gunicorn pre-configures logging
+try:
+    _fh = logging.FileHandler(LOG_FILE, mode='a')
+    _fh.setFormatter(_log_format)
+    if not any(isinstance(h, logging.FileHandler) for h in log.handlers):
+        log.addHandler(_fh)
+    # Also add to root logger so all logs go to file
+    root_log = logging.getLogger()
+    if not any(isinstance(h, logging.FileHandler) for h in root_log.handlers):
+        root_log.addHandler(_fh)
+except Exception:
+    pass  # Never crash on logging setup
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
