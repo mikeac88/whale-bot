@@ -397,9 +397,10 @@ def execute(setups, healthy, cash, label=""):
     except:
         acct_dt = t["day_trades_used"]
 
-    # HARD PDT LIMIT — stop at 2 day trades no exceptions
-    if acct_dt >= MAX_DT:
-        alert(f"⚠️ PDT limit reached ({acct_dt} day trades used) — swing trades only","warning")
+    # HARD PDT LIMIT — always read from Alpaca directly
+    pdt_maxed = acct_dt >= MAX_DT
+    if pdt_maxed:
+        alert(f"🛑 PDT limit reached ({acct_dt}/{MAX_DT} day trades) — swing trades ONLY today","warning")
 
     # Filter out tickers that already lost today — no throwing good money after bad
     with state_lock:
@@ -417,29 +418,32 @@ def execute(setups, healthy, cash, label=""):
     alert(f"{tags} {best['dir']} {best['sym']} | Score:{best['score']} | {best['chg']:+.1f}% | Vol:{best['vol']}x | ${best['cost']:.2f}","info")
 
     if best["tier"]==3:
-        # Extreme whale — use swing if PDT maxed
-        swing = acct_dt >= MAX_DT
+        swing = pdt_maxed
         alert(f"🚨 EXTREME WHALE — {'SWING' if swing else 'DAY TRADE'}: {best['sym']}","warning")
         ok,k = place(best, swing=swing)
         if ok:
             record(0, k or "day")
             with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
 
-    elif best["score"] >= 75 and acct_dt < MAX_DT:
+    elif pdt_maxed and best["score"] >= 65:
+        alert(f"🔄 PDT maxed ({acct_dt}/{MAX_DT}) — SWING only: {best['sym']}","warning")
+        ok,k = place(best, swing=True)
+        if ok:
+            record(0, "swing")
+            with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
+
+    elif pdt_maxed:
+        alert(f"🛑 PDT maxed ({acct_dt}/{MAX_DT}) — skipping {best['sym']} (score too low for swing)","warning")
+        return
+
+    elif best["score"] >= 75:
         alert(f"🤖 HIGH SCORE ({best['score']}) — day trading {best['sym']}","info")
         ok,k = place(best, swing=False)
         if ok:
             record(0, "day")
             with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
 
-    elif best["score"] >= 65 and acct_dt >= MAX_DT:
-        alert(f"🔄 PDT limit — swing trade {best['sym']} (hold overnight)","warning")
-        ok,k = place(best, swing=True)
-        if ok:
-            record(0, "swing")
-            with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
-
-    elif best["score"] >= required and acct_dt < MAX_DT:
+    elif best["score"] >= required:
         alert(f"🤖 Auto-trade {best['sym']} score:{best['score']}","info")
         ok,k = place(best, swing=False)
         if ok:
@@ -447,7 +451,7 @@ def execute(setups, healthy, cash, label=""):
             with state_lock: state["traded_today"].append(best["sym"]) if best["sym"] not in state["traded_today"] else None
 
     else:
-        alert(f"👤 No action: {best['sym']} score:{best['score']} | DT used:{acct_dt}/{MAX_DT}","warning")
+        alert(f"👤 No action: {best['sym']} score:{best['score']} | DT:{acct_dt}/{MAX_DT}","warning")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT JOBS
@@ -687,11 +691,13 @@ def api_data():
             traded  = list(state["traded_today"])
             lost    = list(state["lost_today"])
 
-        # Real P&L = equity vs start of day
+        # Real P&L = equity vs start of day baseline
+        # last_equity resets each day - use sma as more stable baseline
         equity     = float(acct.get("equity", 0))
-        last_eq    = float(acct.get("last_equity", 0))
+        last_eq    = float(acct.get("last_equity", equity))
         real_pnl   = round(equity - last_eq, 2)
         dt_used    = int(acct.get("daytrade_count", 0))
+        pdt_flag   = acct.get("pattern_day_trader", False)
 
         return jsonify({
             "equity":      equity,
@@ -703,6 +709,7 @@ def api_data():
             "wr":          win_rate(),
             "dt_used":     dt_used,
             "dt_max":      MAX_DT,
+            "pdt_flagged": pdt_flag,
             "paused":      state["paused"],
             "e_stop":      state["e_stop"],
             "market_open": clk.get("is_open", False),
@@ -868,7 +875,7 @@ td{padding:7px 8px;border-bottom:1px solid rgba(24,32,48,.5);color:var(--t)}
     <div class="card"><div class="ct">Portfolio Value</div><div class="sv" id="eq">—</div><div class="ss" id="eq-s">—</div></div>
     <div class="card"><div class="ct">Today's P&L</div><div class="sv" id="dpnl">—</div><div class="gbar"><div class="gtrack"><div class="gfill" id="gfill" style="width:0"></div></div><div class="glabel"><span>$0</span><span id="glbl">$100 goal</span></div></div></div>
     <div class="card"><div class="ct">Win / Loss Today</div><div class="sv" id="wl">—</div><div class="ss" id="wr">Win rate: —</div></div>
-    <div class="card"><div class="ct">Day Trades Used</div><div class="sv" id="dt">—</div><div class="ss">Max 2 (keeping 1 reserve)</div></div>
+    <div class="card"><div class="ct">Day Trades Used</div><div class="sv" id="dt">—</div><div class="ss" id="dt-sub">Max 2 (keeping 1 reserve)</div></div>
   </div>
   <div class="g2">
     <div class="card">
@@ -975,11 +982,17 @@ async function load(){
     // Win/loss
     document.getElementById('wl').textContent=`${d.wins||0}W / ${d.losses||0}L`;
     document.getElementById('wr').textContent=`All-time win rate: ${d.wr||0}%`;
-    // Day trades — show real count vs max
+    // Day trades — show real count vs max with PDT warning
     const dtMax = d.dt_max || 2;
     const dtEl = document.getElementById('dt');
     dtEl.textContent = `${d.dt_used||0} / ${dtMax}`;
     dtEl.className = 'sv ' + ((d.dt_used||0) >= dtMax ? 'r' : 'g');
+    const dtSub = document.getElementById('dt-sub');
+    if(dtSub){
+      if(d.pdt_flagged){ dtSub.textContent='⚠️ PDT FLAGGED — swing trades only'; dtSub.style.color='var(--r)'; }
+      else if((d.dt_used||0) >= dtMax){ dtSub.textContent='Limit reached — swing trades only'; dtSub.style.color='var(--w)'; }
+      else{ dtSub.textContent='Max 2 (keeping 1 reserve)'; dtSub.style.color=''; }
+    }
     // Market badge
     const mb=document.getElementById('mbadge');
     mb.className='mbadge '+(d.market_open?'mo':'mc');mb.textContent=d.market_open?'MARKET OPEN':'MARKET CLOSED';
@@ -1004,10 +1017,13 @@ async function load(){
     const ot=document.getElementById('ord-tb');
     if(!d.orders||!d.orders.length){ot.innerHTML='<tr><td colspan="5" class="empty">No open orders</td></tr>'}
     else ot.innerHTML=d.orders.map(o=>`<tr><td><b>${o.symbol}</b></td><td class="${o.side==='buy'?'g':'r'}">${o.side?.toUpperCase()}</td><td>${o.qty}</td><td>${(o.type||'').toUpperCase()}</td><td><button class="cbtn" onclick="cancelOrd('${o.id}')">CANCEL</button></td></tr>`).join('');
-    // Alerts — always update so new scans always show
+    // Alerts — always update
+    const lg=document.getElementById('log');
     if(d.alerts && d.alerts.length > 0){
-      const lg=document.getElementById('log');
       lg.innerHTML=d.alerts.slice().reverse().map(a=>`<div class="li2 a${a.l||'i'}"><span class="ltime">${a.t||''}</span><span class="lmsg">${a.m||''}</span></div>`).join('');
+    } else {
+      const now=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date());
+      lg.innerHTML=`<div class="li2 ai"><span class="ltime">${now}</span><span class="lmsg">Bot running — waiting for market activity...</span></div>`;
     }
   }catch(e){
     console.error('Load error:',e);
