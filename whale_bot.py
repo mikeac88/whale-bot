@@ -105,13 +105,38 @@ def aDel(path):
     r = requests.delete(ALPACA_URL+path, headers=HEADERS, timeout=15)
     return r.json() if r.text.strip() else {}
 
+ALERTS_FILE = "/tmp/whale_alerts.json"
+
 def alert(msg, level="info"):
+    """Write alert to memory AND file so it survives worker restarts."""
     entry = {"t": datetime.now(ET).strftime("%H:%M"), "m": msg, "l": level}
     with state_lock:
         state["alerts"].append(entry)
-        if len(state["alerts"]) > 60:
+        if len(state["alerts"]) > 80:
             state["alerts"].pop(0)
+    try:
+        existing = []
+        if os.path.exists(ALERTS_FILE):
+            with open(ALERTS_FILE, "r") as f:
+                existing = json.load(f)
+        existing.append(entry)
+        with open(ALERTS_FILE, "w") as f:
+            json.dump(existing[-80:], f)
+    except Exception as e:
+        log.debug(f"Alert file error: {e}")
     log.info(msg)
+
+def load_alerts_from_file():
+    """Restore alerts from file after restart."""
+    try:
+        if os.path.exists(ALERTS_FILE):
+            with open(ALERTS_FILE, "r") as f:
+                saved = json.load(f)
+            with state_lock:
+                state["alerts"] = saved[-80:]
+            log.info(f"📋 Restored {len(saved)} alerts from file")
+    except Exception as e:
+        log.debug(f"Alert restore error: {e}")
 
 def is_paused():
     with state_lock:
@@ -572,6 +597,7 @@ def keepalive_loop():
         time.sleep(270)  # Every 4.5 minutes
 
 def bot_loop():
+    load_alerts_from_file()  # Restore alerts after restart
     alert("🐋 Whale Bot v3 online — pure equity momentum","success")
     alert(f"Scanning {len(TICKERS)} tickers | ${TRADE_SIZE}/trade | Goal: ${DAILY_GOAL}/day","info")
 
@@ -691,13 +717,34 @@ def api_data():
             traded  = list(state["traded_today"])
             lost    = list(state["lost_today"])
 
-        # Real P&L = equity vs start of day baseline
-        # last_equity resets each day - use sma as more stable baseline
+        # Real P&L from equity vs yesterday close
         equity     = float(acct.get("equity", 0))
         last_eq    = float(acct.get("last_equity", equity))
         real_pnl   = round(equity - last_eq, 2)
         dt_used    = int(acct.get("daytrade_count", 0))
         pdt_flag   = acct.get("pattern_day_trader", False)
+
+        # Get today's trade history from Alpaca directly
+        today_trades = []
+        try:
+            today = datetime.now(ET).strftime("%Y-%m-%d")
+            fills = aGet("/v2/account/activities/FILL",
+                        params={"date": today, "direction": "desc", "page_size": 20})
+            # Build clean trade list — only show buys and take-profit/stop sells
+            seen_orders = set()
+            for f in fills:
+                oid = f.get("order_id","")
+                if oid not in seen_orders:
+                    seen_orders.add(oid)
+                    today_trades.append({
+                        "sym":   f.get("symbol",""),
+                        "side":  f.get("side",""),
+                        "qty":   f.get("cum_qty", f.get("qty","")),
+                        "price": float(f.get("price",0)),
+                        "time":  f.get("transaction_time","")[:16].replace("T"," "),
+                    })
+        except Exception as e:
+            log.debug(f"Trade history error: {e}")
 
         return jsonify({
             "equity":      equity,
@@ -719,6 +766,7 @@ def api_data():
             "alerts":      alerts[-40:],
             "traded_today":traded,
             "lost_today":  lost,
+            "trades":      today_trades,
             "goal":        DAILY_GOAL,
             "trade_size":  TRADE_SIZE,
         })
@@ -903,9 +951,10 @@ td{padding:7px 8px;border-bottom:1px solid rgba(24,32,48,.5);color:var(--t)}
       <div class="log" id="log"><div class="li2 ai"><span class="ltime">--:--</span><span class="lmsg">Connecting...</span></div></div>
     </div>
     <div class="card">
-      <div class="ct">Open Orders</div>
-      <table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th></th></tr></thead>
-      <tbody id="ord-tb"><tr><td colspan="5" class="empty">No open orders</td></tr></tbody></table>
+      <div class="ct">Today's Trades</div>
+      <div id="trades-list" style="font-family:var(--m);font-size:11px;max-height:240px;overflow-y:auto">
+        <div style="color:var(--d);padding:10px 0">No trades today</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1017,6 +1066,19 @@ async function load(){
     const ot=document.getElementById('ord-tb');
     if(!d.orders||!d.orders.length){ot.innerHTML='<tr><td colspan="5" class="empty">No open orders</td></tr>'}
     else ot.innerHTML=d.orders.map(o=>`<tr><td><b>${o.symbol}</b></td><td class="${o.side==='buy'?'g':'r'}">${o.side?.toUpperCase()}</td><td>${o.qty}</td><td>${(o.type||'').toUpperCase()}</td><td><button class="cbtn" onclick="cancelOrd('${o.id}')">CANCEL</button></td></tr>`).join('');
+    // Trade history
+    const tl = document.getElementById('trades-list');
+    if(d.trades && d.trades.length > 0){
+      tl.innerHTML = d.trades.map(t=>`
+        <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b)">
+          <span class="${t.side==='buy'?'g':'r'}">${t.side?.toUpperCase()} ${t.sym}</span>
+          <span>$${t.price?.toFixed(2)}</span>
+          <span style="color:var(--d);font-size:10px">${t.time?.slice(11)||''}</span>
+        </div>`).join('');
+    } else {
+      tl.innerHTML = '<div style="color:var(--d);padding:10px 0;font-size:11px">No trades today</div>';
+    }
+
     // Alerts — always update
     const lg=document.getElementById('log');
     if(d.alerts && d.alerts.length > 0){
