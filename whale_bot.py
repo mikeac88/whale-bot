@@ -534,8 +534,10 @@ def bot_loop():
         if get_clock().get("is_open"):
             push_alert("🔄 Market open — startup scan running", "info")
             job("STARTUP SCAN")
+        else:
+            push_alert("💤 Market closed — waiting for open", "info")
     except Exception as e:
-        log.error(f"Startup scan error: {e}")
+        push_alert(f"⚠️ Startup error: {e}", "warning")
 
     triggered = set()
     while True:
@@ -561,12 +563,15 @@ def bot_loop():
                 fetch_news(); triggered.add(f"news_{key}")
 
             elif 9 <= h < 16 and m % 2 == 0 and key not in triggered:
-                monitor()
-                if not is_occupied() and not is_paused():
-                    setups, ok = full_scan("CONTINUOUS")
-                    whales = [s for s in setups if s["tier"] >= 2]
-                    if whales:
-                        execute(whales, ok, "WHALE ALERT")
+                try:
+                    monitor()
+                    if not is_occupied() and not is_paused():
+                        setups, ok = full_scan("CONTINUOUS")
+                        whales = [s for s in setups if s["tier"] >= 2]
+                        if whales:
+                            execute(whales, ok, "WHALE ALERT")
+                except Exception as scan_err:
+                    push_alert(f"⚠️ Scan error: {scan_err}", "warning")
                 triggered.add(key)
 
             if h == 0 and m == 1 and "midnight" not in triggered:
@@ -574,7 +579,8 @@ def bot_loop():
 
             time.sleep(20)
         except Exception as e:
-            log.error(f"Bot loop error: {e}"); time.sleep(60)
+            push_alert(f"⚠️ Bot loop error: {e}", "error")
+            time.sleep(60)
 
 # ── FLASK APP ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
