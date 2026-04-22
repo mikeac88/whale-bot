@@ -611,6 +611,19 @@ def api_data():
             pos  = list(_cache["pos"])
             ords = list(_cache["ords"])
             clk  = dict(_cache["clk"])
+
+        # If cache is empty (just started) — fetch directly
+        if not acct:
+            try:
+                acct = get_account()
+                pos  = get_positions()
+                ords = get_orders()
+                clk  = get_clock()
+                # Populate cache immediately
+                with _cache_lock:
+                    _cache.update({"acct": acct, "pos": pos, "ords": ords, "clk": clk})
+            except Exception as e:
+                log.error(f"Direct fetch error: {e}")
         with _lock:
             alerts  = list(_state["alerts"])
             traded  = list(_state["traded_today"])
