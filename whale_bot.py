@@ -65,7 +65,11 @@ except Exception:
 
 # ── WATCHLIST ─────────────────────────────────────────────────────────────────
 TIER1 = ["NVDA","AMD","TSLA","PLTR","SMCI","MSTR","MARA","RIOT","SOXL","TQQQ"]
-TICKERS = list(set(TIER1 + [
+
+# Bear market inverse ETFs — go UP when market drops
+BEAR_TICKERS = ["SQQQ","SPXS","SDOW","TZA","FAZ","UVXY","VXX","SOXS","TECS","LABD"]
+
+TICKERS = list(set(TIER1 + BEAR_TICKERS + [
     "META","GOOGL","MSFT","AMZN","AAPL","NFLX","UBER","HOOD","SOFI","UPST","COIN","ARKK",
     "OXY","DVN","MRO","HAL","XLE","BOIL","UCO","ERX",
     "CCJ","NNE","OKLO","SMR","UEC","URA",
@@ -328,8 +332,17 @@ def full_scan(label="SCAN"):
     if news:
         push_alert(f"📰 Including {len(news)} news tickers: {', '.join(news)}", "info")
 
-    push_alert(f"🔍 {label}: scanning {len(all_tickers)} tickers...", "info")
     ok, chg = market_regime()
+    regime = "✅ BULL" if ok else "⚠️ BEAR"
+
+    # In bear market — lower threshold and prioritize inverse ETFs
+    # Bear market = look for SQQQ, SPXS, UVXY etc moving up
+    effective_score = MIN_SCORE if ok else max(MIN_SCORE - 10, 45)
+    if not ok:
+        push_alert(f"🔍 {label}: BEAR market — scanning {len(all_tickers)} tickers (threshold lowered to {effective_score})", "info")
+    else:
+        push_alert(f"🔍 {label}: scanning {len(all_tickers)} tickers...", "info")
+
     try:
         cash = float(get_account().get("cash", TRADE_SIZE))
     except Exception:
@@ -341,20 +354,27 @@ def full_scan(label="SCAN"):
         futs = {ex.submit(scan_one, s, chg, ok, tsize): s for s in all_tickers}
         for f in as_completed(futs):
             r = f.result()
-            if r: setups.append(r)
+            if r and r["score"] >= effective_score:
+                setups.append(r)
+
+    # In bear market — boost inverse ETFs to top of list
+    if not ok:
+        for s in setups:
+            if s["sym"] in BEAR_TICKERS:
+                s["score"] = min(100, s["score"] + 15)
 
     setups.sort(key=lambda x: (x["tier"], x["score"]), reverse=True)
     top = setups[:5]
-    regime = "✅ BULL" if ok else "⚠️ BEAR"
 
     if top:
         lines = [f"✅ {label} | {regime} | {len(setups)} setups found"]
         for i, s in enumerate(top[:3]):
             w = "🐋" if s["tier"]>=2 else "🐳" if s["tier"]==1 else "📊"
-            lines.append(f"  #{i+1} {w} {s['sym']} score:{s['score']} {s['chg']:+.1f}% vol:{s['vol']}x")
+            bear_tag = " 🔻BEAR" if s["sym"] in BEAR_TICKERS else ""
+            lines.append(f"  #{i+1} {w} {s['sym']}{bear_tag} score:{s['score']} {s['chg']:+.1f}% vol:{s['vol']}x")
         push_alert("\n".join(lines), "success")
     else:
-        push_alert(f"✅ {label} | {regime} | No setups above score {MIN_SCORE}", "info")
+        push_alert(f"📊 {label} | {regime} | No setups found — watching", "info")
 
     return top, ok
 
@@ -486,11 +506,18 @@ def eod():
 def job(label):
     if is_paused():
         push_alert(f"⏸️ Paused — skipping {label}", "warning"); return
-    # No new entries 9:30-9:44 (opening volatility)
+    setups, ok = full_scan(label)
+    # Opening window 9:30-9:44 — only skip low conviction trades
     now = datetime.now(ET)
     if now.hour == 9 and now.minute < 45 and label not in ("PREMARKET 8AM", "OPENING RANGE"):
-        push_alert("⏳ Opening volatility window — not entering yet", "info"); return
-    setups, ok = full_scan(label)
+        # Allow tier 2+ whales or score 80+ through — they're real moves
+        high_conviction = [s for s in setups if s["tier"] >= 2 or s["score"] >= 80]
+        if high_conviction:
+            push_alert(f"🚀 High conviction at open — executing {high_conviction[0]['sym']} score:{high_conviction[0]['score']}", "warning")
+            execute(high_conviction, ok, label)
+        else:
+            push_alert("⏳ Opening window (9:30-9:44) — waiting for score 80+ or whale tier 2+", "info")
+        return
     execute(setups, ok, label)
 
 # ── BACKGROUND THREADS ────────────────────────────────────────────────────────
