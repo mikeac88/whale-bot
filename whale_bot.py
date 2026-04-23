@@ -8,7 +8,7 @@ Set these in Render environment:
   DASHBOARD_PASSWORD = whale2024
   RENDER_EXTERNAL_URL = https://whale-bot-3ijd.onrender.com
   MIN_PRICE          = 10
-  MIN_SCORE          = 65
+  MIN_SCORE          = 55
   STOP_PCT           = 0.05
   MAX_DAY_TRADES     = 2
 """
@@ -32,7 +32,7 @@ DAILY_GOAL = float(os.environ.get("DAILY_GOAL",   "100"))
 MAX_LOSS   = float(os.environ.get("MAX_LOSS",     "50"))
 STOP_PCT   = float(os.environ.get("STOP_PCT",     "0.05"))
 TARGET_PCT = float(os.environ.get("TARGET_PCT",   "0.07"))
-MIN_SCORE  = int(os.environ.get("MIN_SCORE",      "65"))
+MIN_SCORE  = int(os.environ.get("MIN_SCORE",      "55"))
 MIN_PRICE  = float(os.environ.get("MIN_PRICE",    "10.0"))
 MAX_DT     = int(os.environ.get("MAX_DAY_TRADES", "2"))
 
@@ -75,6 +75,10 @@ TICKERS = list(set(TIER1 + BEAR_TICKERS + [
     "CCJ","NNE","OKLO","SMR","UEC","URA",
     "FCX","MP","LAC","ALB","COPX","GDX","GDXJ","NEM","WPM",
     "IONQ","RGTI","RKLB","ASTS","LUNR","CLSK","WULF","JOBY",
+    # High liquidity earnings movers
+    "TXN","URI","IBM","NOW","TSLA","AAL","CMCSA","BA","MU","AMD",
+    # High beta momentum names
+    "CVNA","MSTR","SHOP","SNAP","RBLX","DKNG","PENN","CHWY","LYFT",
 ]))
 
 # ── SHARED STATE ──────────────────────────────────────────────────────────────
@@ -267,13 +271,18 @@ def score_ticker(sym, snap, dbars, mbars, spy_chg=0.0, healthy=True):
     vr  = d.get("v",0) / max(p.get("v",1),1)
     direction = "LONG" if chg > 0 else "SHORT"
     score = 0
-
-    tier,_ = whale_tier(snap)
-    score += {3:40, 2:32, 1:24, 0:12 if vr>=3 else 6 if vr>=2 else 0}[tier]
-    if score == 0: return 0, direction
-
     ac = abs(chg)
-    score += 20 if ac>=0.10 else 16 if ac>=0.06 else 11 if ac>=0.03 else 6 if ac>=0.015 else 0
+
+    # Volume score — lowered floor to 1.2x so quiet days still score
+    tier,_ = whale_tier(snap)
+    score += {3:40, 2:32, 1:24, 0:16 if vr>=3 else 12 if vr>=2 else 8 if vr>=1.5 else 4 if vr>=1.2 else 0}[tier]
+
+    # Price move score — strong moves score independently of volume
+    # This catches earnings movers and news-driven moves on normal volume
+    score += 30 if ac>=0.10 else 24 if ac>=0.07 else 18 if ac>=0.04 else 12 if ac>=0.025 else 6 if ac>=0.015 else 0
+
+    # Need at least some base score to continue
+    if score < 8: return 0, direction
 
     r = calc_rsi(dbars)
     if direction=="LONG":
@@ -337,7 +346,7 @@ def full_scan(label="SCAN"):
 
     # In bear market — lower threshold and prioritize inverse ETFs
     # Bear market = look for SQQQ, SPXS, UVXY etc moving up
-    effective_score = MIN_SCORE if ok else max(MIN_SCORE - 10, 45)
+    effective_score = MIN_SCORE if ok else max(MIN_SCORE - 10, 40)
     if not ok:
         push_alert(f"🔍 {label}: BEAR market — scanning {len(all_tickers)} tickers (threshold lowered to {effective_score})", "info")
     else:
