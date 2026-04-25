@@ -556,6 +556,7 @@ def job(label):
 def cache_refresh_loop():
     """Keep Alpaca data fresh in background — never blocks Flask."""
     time.sleep(5)
+    counter = 0
     while True:
         try:
             acct = get_account()
@@ -564,6 +565,10 @@ def cache_refresh_loop():
             clk  = get_clock()
             with _cache_lock:
                 _cache.update({"acct": acct, "pos": pos, "ords": ords, "clk": clk})
+            # Refresh trades cache every 30 seconds (every 3rd loop)
+            if counter % 3 == 0:
+                _trades_cache_refresh()
+            counter += 1
         except Exception as e:
             log.debug(f"Cache error: {e}")
         time.sleep(10)
@@ -662,6 +667,25 @@ def authed():
 def index():
     return DASHBOARD_HTML
 
+# Trades cache — refreshed every 30 seconds in cache_refresh_loop
+_trades_cache_lock = threading.Lock()
+_trades_cache = {"data": ([], 0, 0, 0.0), "ts": None}
+
+def _trades_cache_get():
+    """Return cached trades data — refreshed by background thread."""
+    with _trades_cache_lock:
+        return _trades_cache["data"]
+
+def _trades_cache_refresh():
+    """Compute trades + P&L from Alpaca fills."""
+    try:
+        result = calc_today_trades_and_pnl()
+        with _trades_cache_lock:
+            _trades_cache["data"] = result
+            _trades_cache["ts"] = datetime.now(ET)
+    except Exception as e:
+        log.debug(f"Trades cache error: {e}")
+
 def get_today_fills():
     """Fetch today's fills using proper UTC timestamp filter."""
     try:
@@ -743,19 +767,24 @@ def calc_today_trades_and_pnl():
 @app.route("/api/data")
 def api_data():
     try:
-        # Direct Alpaca fetch — always accurate. Cache only as fallback.
-        try:    acct = get_account()
-        except:
-            with _cache_lock: acct = dict(_cache["acct"])
-        try:    pos  = get_positions()
-        except:
-            with _cache_lock: pos = list(_cache["pos"])
-        try:    ords = get_orders()
-        except:
-            with _cache_lock: ords = list(_cache["ords"])
-        try:    clk  = get_clock()
-        except:
-            with _cache_lock: clk = dict(_cache["clk"])
+        # Read from cache first (fast). Only direct fetch if cache is empty.
+        with _cache_lock:
+            acct = dict(_cache["acct"])
+            pos  = list(_cache["pos"])
+            ords = list(_cache["ords"])
+            clk  = dict(_cache["clk"])
+
+        if not acct:
+            # Cache empty (just started) — do ONE direct fetch to populate
+            try:
+                acct = get_account()
+                pos  = get_positions()
+                ords = get_orders()
+                clk  = get_clock()
+                with _cache_lock:
+                    _cache.update({"acct": acct, "pos": pos, "ords": ords, "clk": clk})
+            except Exception as e:
+                log.error(f"Initial fetch error: {e}")
 
         with _lock:
             alerts = list(_state["alerts"])
@@ -766,8 +795,8 @@ def api_data():
         dt_used  = int(acct.get("daytrade_count", 0))
         pdt_flag = bool(acct.get("pattern_day_trader", False))
 
-        # Real trades + realized P&L from Alpaca fills
-        trades, wins, losses, realized = calc_today_trades_and_pnl()
+        # Real trades + realized P&L from Alpaca fills (cached separately)
+        trades, wins, losses, realized = _trades_cache_get()
         unrealized = sum(float(p.get("unrealized_pl", 0)) for p in pos)
         daily_pnl  = round(realized + unrealized, 2)
 
