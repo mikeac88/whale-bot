@@ -1142,9 +1142,9 @@ async function load(){
   else{dtSub.textContent='Max '+(d.dt_max||2)+' day trades';dtSub.style.color='';}
 
   // Market
-  const mb=document.getElementById('mbadge');
-  if(d.market_open){mb.className='mbadge mo';mb.textContent='MARKET OPEN';}
-  else{mb.className='mbadge mc';const no=d.next_open?new Date(d.next_open).toLocaleString('en-US',{timeZone:'America/New_York',weekday:'short',hour:'2-digit',minute:'2-digit'}):'';mb.textContent=no?'Opens '+no:'MARKET CLOSED';}
+  const marketBadge=document.getElementById('mbadge');
+  if(d.market_open){marketBadge.className='mbadge mo';marketBadge.textContent='MARKET OPEN';}
+  else{marketBadge.className='mbadge mc';const no=d.next_open?new Date(d.next_open).toLocaleString('en-US',{timeZone:'America/New_York',weekday:'short',hour:'2-digit',minute:'2-digit'}):'';marketBadge.textContent=no?'Opens '+no:'MARKET CLOSED';}
 
   // Bot status
   const dot=document.getElementById('sdot'),st=document.getElementById('stxt');
