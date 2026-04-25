@@ -27,14 +27,20 @@ DASH_PASS  = os.environ.get("DASHBOARD_PASSWORD","whale2024")
 PORT       = int(os.environ.get("PORT",          8080))
 KEEPALIVE  = os.environ.get("RENDER_EXTERNAL_URL","")
 
-TRADE_SIZE = float(os.environ.get("TRADE_SIZE",   "45"))
+TRADE_SIZE = float(os.environ.get("TRADE_SIZE",   "25"))   # Safer default for live launch
 DAILY_GOAL = float(os.environ.get("DAILY_GOAL",   "100"))
-MAX_LOSS   = float(os.environ.get("MAX_LOSS",     "50"))
+MAX_LOSS   = float(os.environ.get("MAX_LOSS",     "25"))   # Tight circuit breaker first week
 STOP_PCT   = float(os.environ.get("STOP_PCT",     "0.05"))
 TARGET_PCT = float(os.environ.get("TARGET_PCT",   "0.07"))
 MIN_SCORE  = int(os.environ.get("MIN_SCORE",      "55"))
 MIN_PRICE  = float(os.environ.get("MIN_PRICE",    "10.0"))
 MAX_DT     = int(os.environ.get("MAX_DAY_TRADES", "2"))
+
+# Auto-detect live trading mode from BASE_URL — adds dashboard warning
+LIVE_MODE = "paper" not in BASE_URL.lower()
+
+# Max risk per trade: 1% of cash on hand — hard cap regardless of TRADE_SIZE
+MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 
 ET = pytz.timezone("America/New_York")
 
@@ -458,6 +464,23 @@ def execute(setups, healthy, label=""):
         push_alert("📊 All setups already lost today — skipping", "info"); return
 
     best = filtered[0]
+
+    # MAX RISK CAP: never risk more than MAX_RISK_PCT of account on a single trade
+    try:
+        cash = float(get_account().get("cash", 0))
+        position_value = best["shares"] * best["price"]
+        max_position = cash * (MAX_RISK_PCT * 100)  # Allow position up to 100x risk pct
+        if position_value > max_position:
+            # Reduce shares to fit risk cap
+            new_shares = max(1, int(max_position / best["price"]))
+            if new_shares < best["shares"]:
+                push_alert(
+                    f"⚠️ Position size capped: {best['sym']} reduced "
+                    f"{best['shares']}→{new_shares} shares (1% account risk)", "warning")
+                best["shares"] = new_shares
+    except Exception as e:
+        log.debug(f"Risk cap check error: {e}")
+
     tags = "🚨EXTREME" if best["tier"]==3 else "🐋WHALE" if best["tier"]>=1 else "📊"
     push_alert(
         f"{tags} {best['dir']} {best['sym']} | Score:{best['score']} | "
@@ -639,83 +662,149 @@ def authed():
 def index():
     return DASHBOARD_HTML
 
+def get_today_fills():
+    """Fetch today's fills using proper UTC timestamp filter."""
+    try:
+        now_et = datetime.now(ET)
+        today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_utc = today_start.astimezone(pytz.UTC)
+        after = today_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return aGet("/v2/account/activities/FILL",
+                    params={"after": after, "direction":"asc","page_size":100}) or []
+    except Exception as e:
+        log.debug(f"Fills error: {e}")
+        return []
+
+def calc_today_trades_and_pnl():
+    """Group fills into trades and calculate realized P&L using FIFO matching."""
+    fills = get_today_fills()
+    if not fills:
+        return [], 0, 0, 0.0
+
+    # Group partial fills by order_id
+    by_order = {}
+    for f in fills:
+        oid = f.get("order_id","")
+        if oid not in by_order:
+            by_order[oid] = {
+                "sym":   f.get("symbol",""),
+                "side":  f.get("side",""),
+                "qty":   0,
+                "value": 0.0,
+                "time":  f.get("transaction_time","")[:19].replace("T"," "),
+            }
+        q = float(f.get("qty", 0))
+        p = float(f.get("price", 0))
+        by_order[oid]["qty"]   += q
+        by_order[oid]["value"] += q * p
+
+    trades = []
+    for oid, t in by_order.items():
+        if t["qty"] > 0:
+            trades.append({
+                "sym":   t["sym"],
+                "side":  t["side"],
+                "qty":   int(t["qty"]),
+                "price": round(t["value"] / t["qty"], 2),
+                "time":  t["time"],
+            })
+    trades.sort(key=lambda x: x["time"])
+
+    # FIFO match buys with sells per symbol
+    by_sym = {}
+    for t in trades:
+        sym = t["sym"]
+        by_sym.setdefault(sym, {"buys": [], "sells": []})
+        by_sym[sym]["buys" if t["side"]=="buy" else "sells"].append({
+            "qty": t["qty"], "price": t["price"]
+        })
+
+    wins = 0; losses = 0; realized = 0.0
+    for sym, data in by_sym.items():
+        buys = [b.copy() for b in data["buys"]]
+        for sell in data["sells"]:
+            qty_left = sell["qty"]
+            cost = 0.0
+            for buy in buys:
+                if qty_left <= 0 or buy["qty"] <= 0: continue
+                take = min(qty_left, buy["qty"])
+                cost += take * buy["price"]
+                buy["qty"] -= take
+                qty_left  -= take
+            matched = sell["qty"] - qty_left
+            if matched > 0:
+                pnl = (sell["price"] * matched) - cost
+                realized += pnl
+                if pnl > 0: wins += 1
+                else:       losses += 1
+
+    return trades, wins, losses, round(realized, 2)
+
 @app.route("/api/data")
 def api_data():
     try:
-        with _cache_lock:
-            acct = dict(_cache["acct"])
-            pos  = list(_cache["pos"])
-            ords = list(_cache["ords"])
-            clk  = dict(_cache["clk"])
+        # Direct Alpaca fetch — always accurate. Cache only as fallback.
+        try:    acct = get_account()
+        except:
+            with _cache_lock: acct = dict(_cache["acct"])
+        try:    pos  = get_positions()
+        except:
+            with _cache_lock: pos = list(_cache["pos"])
+        try:    ords = get_orders()
+        except:
+            with _cache_lock: ords = list(_cache["ords"])
+        try:    clk  = get_clock()
+        except:
+            with _cache_lock: clk = dict(_cache["clk"])
 
-        # If cache is empty (just started) — fetch directly
-        if not acct:
-            try:
-                acct = get_account()
-                pos  = get_positions()
-                ords = get_orders()
-                clk  = get_clock()
-                # Populate cache immediately
-                with _cache_lock:
-                    _cache.update({"acct": acct, "pos": pos, "ords": ords, "clk": clk})
-            except Exception as e:
-                log.error(f"Direct fetch error: {e}")
         with _lock:
-            alerts  = list(_state["alerts"])
-            traded  = list(_state["traded_today"])
-            lost    = list(_state["lost_today"])
-            tracker = dict(_state["tracker"])
+            alerts = list(_state["alerts"])
+            traded = list(_state["traded_today"])
+            lost   = list(_state["lost_today"])
 
         equity   = float(acct.get("equity",  0))
-        last_eq  = float(acct.get("last_equity", equity))
-        real_pnl = round(equity - last_eq, 2)
         dt_used  = int(acct.get("daytrade_count", 0))
         pdt_flag = bool(acct.get("pattern_day_trader", False))
 
-        # Today's trades from Alpaca fills
-        trades = []
-        try:
-            today = datetime.now(ET).strftime("%Y-%m-%d")
-            fills = aGet("/v2/account/activities/FILL",
-                         params={"date": today, "direction":"desc","page_size":20})
-            seen = set()
-            for f in fills:
-                oid = f.get("order_id","")
-                if oid not in seen:
-                    seen.add(oid)
-                    trades.append({
-                        "sym":   f.get("symbol",""),
-                        "side":  f.get("side",""),
-                        "qty":   f.get("cum_qty", f.get("qty","")),
-                        "price": float(f.get("price",0)),
-                        "time":  f.get("transaction_time","")[:16].replace("T"," "),
-                    })
-        except Exception:
-            pass
+        # Real trades + realized P&L from Alpaca fills
+        trades, wins, losses, realized = calc_today_trades_and_pnl()
+        unrealized = sum(float(p.get("unrealized_pl", 0)) for p in pos)
+        daily_pnl  = round(realized + unrealized, 2)
+
+        with _lock:
+            tw = _state["tracker"].get("total_wins", 0) + wins
+            tt = _state["tracker"].get("total_trades", 0) + wins + losses
+        wr = round(tw / tt * 100, 1) if tt else 0.0
 
         return jsonify({
-            "equity":      equity,
-            "pnl":         real_pnl,
-            "daily_pnl":   real_pnl,
-            "wins":        tracker.get("wins_today", 0),
-            "losses":      tracker.get("losses_today", 0),
-            "win_rate":    win_rate(),
-            "dt_used":     dt_used,
-            "dt_max":      MAX_DT,
-            "pdt_flagged": pdt_flag,
-            "paused":      _state["paused"],
-            "e_stop":      _state["e_stop"],
-            "market_open": clk.get("is_open", False),
-            "next_open":   clk.get("next_open",""),
-            "positions":   pos,
-            "orders":      ords,
-            "alerts":      alerts[-40:],
-            "trades":      trades,
-            "traded_today":traded,
-            "lost_today":  lost,
-            "goal":        DAILY_GOAL,
+            "equity":         equity,
+            "pnl":            daily_pnl,
+            "daily_pnl":      daily_pnl,
+            "realized_pnl":   realized,
+            "unrealized_pnl": round(unrealized, 2),
+            "wins":           wins,
+            "losses":         losses,
+            "win_rate":       wr,
+            "dt_used":        dt_used,
+            "dt_max":         MAX_DT,
+            "pdt_flagged":    pdt_flag,
+            "live_mode":      LIVE_MODE,
+            "trade_size":     TRADE_SIZE,
+            "max_loss":       MAX_LOSS,
+            "paused":         _state["paused"],
+            "e_stop":         _state["e_stop"],
+            "market_open":    clk.get("is_open", False),
+            "next_open":      clk.get("next_open",""),
+            "positions":      pos,
+            "orders":         ords,
+            "alerts":         alerts[-40:],
+            "trades":         trades,
+            "traded_today":   traded,
+            "lost_today":     lost,
+            "goal":           DAILY_GOAL,
         })
     except Exception as e:
+        log.error(f"api_data error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/logs")
@@ -839,7 +928,7 @@ td{padding:6px 8px;border-bottom:1px solid rgba(24,32,48,.5);color:var(--text)}
 </style></head>
 <body>
 <div class="hdr">
-  <div class="logo">🐋 WHALE BOT <span>v4</span></div>
+  <div class="logo">🐋 WHALE BOT <span>v4</span> <span id="mode-badge" style="margin-left:6px;padding:2px 7px;border-radius:10px;font-size:9px;font-weight:700"></span></div>
   <div class="hdr-r">
     <span class="clk" id="clk">--:--:--</span>
     <span class="mbadge mc" id="mbadge">MARKET CLOSED</span>
@@ -981,6 +1070,20 @@ async function closePos(sym){
 async function load(){
   const d=await api('/api/data');
   if(!d||d.error)return;
+
+  // Live/Paper mode badge — critical safety indicator
+  const mb=document.getElementById('mode-badge');
+  if(d.live_mode){
+    mb.textContent='🔴 LIVE';
+    mb.style.background='rgba(255,64,96,.15)';
+    mb.style.color='var(--red)';
+    mb.style.border='1px solid var(--red)';
+  } else {
+    mb.textContent='📝 PAPER';
+    mb.style.background='rgba(61,158,255,.1)';
+    mb.style.color='var(--blue)';
+    mb.style.border='1px solid var(--blue)';
+  }
 
   // Portfolio
   document.getElementById('equity').textContent=fv(d.equity);
