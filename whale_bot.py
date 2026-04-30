@@ -252,6 +252,89 @@ def get_recent_fills(days=7):
     return aGet("/v2/account/activities/FILL",
                 params={"after": after, "direction": "asc", "page_size": 100}) or []
 
+def get_portfolio_history(period="1A", timeframe="1D"):
+    """Fetch Alpaca's portfolio history for a period.
+    Returns dict with 'equity' (array), 'timestamp' (array), 'base_value' (float).
+    period: 1D, 1W, 1M, 3M, 6M, 1A, all
+    timeframe: 1Min, 5Min, 15Min, 1H, 1D"""
+    return aGet("/v2/account/portfolio/history",
+                params={"period": period, "timeframe": timeframe}) or {}
+
+# Period P&L cache — refreshed every 5 minutes (equity moves slowly)
+_period_cache = {"data": None, "ts": None}
+_period_cache_lock = threading.Lock()
+
+def get_period_pnl(force=False):
+    """
+    Return P&L over rolling Daily / Weekly / Monthly / Yearly periods.
+
+    - Daily uses last_equity from /v2/account (= prior session close).
+    - Week/Month/Year use Alpaca's portfolio history endpoint.
+      Each period's base = first equity value in that period's series.
+
+    Cached 5 minutes — these values move slowly and we don't want to hammer
+    Alpaca with 3 history calls every 8 seconds.
+
+    Note on accuracy: rolling periods use Alpaca's defined windows
+    (1W = ~5 trading days, 1M = ~21 days, 1A = ~252 days). They are NOT
+    calendar-aligned (Mon-to-now / 1st-to-now / Jan1-to-now). For most
+    users this distinction is unimportant — both are reasonable measures
+    of recent performance.
+
+    Returns dict with: daily, weekly, monthly, yearly + corresponding
+    _pct fields. Returns zeros if calls fail (dashboard shows '—').
+    """
+    now = datetime.now(ET)
+    with _period_cache_lock:
+        cached = _period_cache["data"]
+        cached_ts = _period_cache["ts"]
+    if not force and cached and cached_ts and (now - cached_ts).total_seconds() < 300:
+        return cached
+
+    result = {
+        "daily": 0.0, "weekly": 0.0, "monthly": 0.0, "yearly": 0.0,
+        "daily_pct": 0.0, "weekly_pct": 0.0, "monthly_pct": 0.0, "yearly_pct": 0.0,
+        "ok": False,  # True only if at least daily computed
+    }
+
+    try:
+        acct = get_account()
+        try:
+            cur = float(acct.get("equity", 0))
+            last_eq = float(acct.get("last_equity", cur))
+        except (TypeError, ValueError):
+            cur = 0.0
+            last_eq = 0.0
+
+        if cur > 0 and last_eq > 0:
+            result["daily"] = round(cur - last_eq, 2)
+            result["daily_pct"] = round((cur - last_eq) / last_eq * 100, 2)
+            result["ok"] = True
+
+        # Fetch each period's history. If a call fails the others still work.
+        periods = [("weekly", "1W"), ("monthly", "1M"), ("yearly", "1A")]
+        for key, period in periods:
+            try:
+                hist = get_portfolio_history(period=period, timeframe="1D")
+                eq_arr = hist.get("equity", []) or []
+                # Filter out null/zero entries (account had no value yet)
+                valid = [float(e) for e in eq_arr if e is not None and float(e) > 0]
+                if valid and cur > 0:
+                    base = valid[0]
+                    if base > 0:
+                        result[key] = round(cur - base, 2)
+                        result[key + "_pct"] = round((cur - base) / base * 100, 2)
+            except Exception as e:
+                log.debug(f"period {key}: {e}")
+
+    except Exception as e:
+        log.debug(f"period pnl outer: {e}")
+
+    with _period_cache_lock:
+        _period_cache["data"] = result
+        _period_cache["ts"] = now
+    return result
+
 # ── TRADE PAIRING & P&L ──────────────────────────────────────────────────────
 def _group_fills(fills):
     """Group partial fills by order_id → list of trades, sorted by time."""
@@ -373,6 +456,7 @@ class DataSnapshot:
         self.clock = {}
         self.fills = []           # today's fills (for display)
         self.lookback_fills = []  # past 7 days (for cross-day FIFO matching)
+        self.period_pnl = {}      # rolling D/W/M/Y P&L
         self.errors = []  # what failed during fetch
 
     def fetch(self):
@@ -413,6 +497,12 @@ class DataSnapshot:
         except Exception as e:
             self.errors.append(f"lookback_fills: {e}")
 
+        # Period P&L (cached internally — only hits Alpaca every 5 min)
+        try:
+            self.period_pnl = get_period_pnl()
+        except Exception as e:
+            self.errors.append(f"period_pnl: {e}")
+
         return self
 
 
@@ -421,7 +511,8 @@ _snap_lock = threading.Lock()
 _snap_data = {"snap": None, "ts": None}
 
 # Last-known-good values per piece — used when a single fetch fails
-_last_good = {"acct": {}, "positions": [], "orders": [], "clock": {}, "fills": [], "lookback_fills": []}
+_last_good = {"acct": {}, "positions": [], "orders": [], "clock": {}, "fills": [],
+              "lookback_fills": [], "period_pnl": {}}
 _last_good_lock = threading.Lock()
 
 def get_snapshot(max_age_s=8):
@@ -458,6 +549,10 @@ def get_snapshot(max_age_s=8):
             if snap.lookback_fills: _last_good["lookback_fills"] = snap.lookback_fills
         else:
             snap.lookback_fills = list(_last_good["lookback_fills"])
+        if snap.period_pnl and snap.period_pnl.get("ok"):
+            _last_good["period_pnl"] = snap.period_pnl
+        elif not snap.period_pnl:
+            snap.period_pnl = dict(_last_good["period_pnl"])
 
     with _snap_lock:
         _snap_data["snap"] = snap
@@ -1007,6 +1102,7 @@ def api_data():
         "traded_today":   traded,
         "lost_today":     lost,
         "goal":           DAILY_GOAL,
+        "period_pnl":     snap.period_pnl or {},
         "snapshot_errors": snap.errors,
         "health":         health,
         "snapshot_age_s": ((datetime.now(ET) - _snap_data["ts"]).total_seconds()
@@ -1205,6 +1301,13 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
 .bn{display:inline-block;font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700}
 .bn.b{background:rgba(0,229,176,.12);color:var(--green)}
 .bn.s{background:rgba(255,64,96,.12);color:var(--red)}
+.period-card{margin-bottom:12px}
+.period-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+@media(max-width:560px){.period-grid{grid-template-columns:repeat(2,1fr);gap:8px}}
+.pcell{padding:10px;background:var(--bg);border:1px solid var(--bdr);border-radius:8px;text-align:center}
+.plabel{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--dim);margin-bottom:4px}
+.pval{font-family:var(--mono);font-size:18px;color:#fff;margin-bottom:2px}
+.ppct{font-family:var(--mono);font-size:10px;color:var(--dim)}
 </style>
 </head>
 <body>
@@ -1252,6 +1355,33 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
       <div class="ct">Day Trades Used</div>
       <div class="sv" id="dt">—</div>
       <div class="ss" id="dt-sub">Max 2 day trades</div>
+    </div>
+  </div>
+
+  <!-- P&L Periods row — Daily / Weekly / Monthly / Yearly -->
+  <div class="card period-card">
+    <div class="ct">P&amp;L Periods</div>
+    <div class="period-grid">
+      <div class="pcell">
+        <div class="plabel">TODAY</div>
+        <div class="pval" id="pp-day">—</div>
+        <div class="ppct" id="pp-day-pct">—</div>
+      </div>
+      <div class="pcell">
+        <div class="plabel">WEEK</div>
+        <div class="pval" id="pp-week">—</div>
+        <div class="ppct" id="pp-week-pct">—</div>
+      </div>
+      <div class="pcell">
+        <div class="plabel">MONTH</div>
+        <div class="pval" id="pp-month">—</div>
+        <div class="ppct" id="pp-month-pct">—</div>
+      </div>
+      <div class="pcell">
+        <div class="plabel">YEAR</div>
+        <div class="pval" id="pp-year">—</div>
+        <div class="ppct" id="pp-year-pct">—</div>
+      </div>
     </div>
   </div>
 
@@ -1416,6 +1546,31 @@ function renderData(d) {
   const gp = Math.min(100, Math.max(0, dpv / (d.goal || 100) * 100));
   $('gfill').style.width = gp + '%';
   $('goal-lbl').textContent = '$' + (d.goal || 100) + ' goal';
+
+  // P&L Periods (Daily / Weekly / Monthly / Yearly)
+  const pp = d.period_pnl || {};
+  const renderPeriod = (idVal, idPct, val, pct) => {
+    const valEl = $(idVal);
+    const pctEl = $(idPct);
+    if (val === undefined || val === null) {
+      valEl.textContent = '—';
+      pctEl.textContent = '—';
+      valEl.className = 'pval';
+      pctEl.className = 'ppct';
+      return;
+    }
+    const v = parseFloat(val) || 0;
+    const p = parseFloat(pct) || 0;
+    valEl.textContent = (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2);
+    pctEl.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
+    const cls = v >= 0 ? 'g' : 'r';
+    valEl.className = 'pval ' + cls;
+    pctEl.className = 'ppct ' + cls;
+  };
+  renderPeriod('pp-day',   'pp-day-pct',   pp.daily,   pp.daily_pct);
+  renderPeriod('pp-week',  'pp-week-pct',  pp.weekly,  pp.weekly_pct);
+  renderPeriod('pp-month', 'pp-month-pct', pp.monthly, pp.monthly_pct);
+  renderPeriod('pp-year',  'pp-year-pct',  pp.yearly,  pp.yearly_pct);
 
   // W/L
   $('wl').textContent = (d.wins || 0) + 'W / ' + (d.losses || 0) + 'L';
