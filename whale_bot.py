@@ -240,13 +240,17 @@ def get_today_fills():
 def get_recent_fills(days=7):
     """Get fills from the past N days — used for cross-day FIFO matching
     so swing trades that close today get correctly counted as wins/losses
-    even though their original buy was on a prior day."""
+    even though their original buy was on a prior day.
+
+    Note: Alpaca's max page_size for activities is 100. For accounts with
+    more than 100 fills in the lookback window, this would need pagination,
+    but for a bot doing 1-3 trades/day with $25 sizes, 100 covers ~1 month."""
     now_et = datetime.now(ET)
     today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     after_dt = today_start - timedelta(days=days)
     after = after_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return aGet("/v2/account/activities/FILL",
-                params={"after": after, "direction": "asc", "page_size": 500}) or []
+                params={"after": after, "direction": "asc", "page_size": 100}) or []
 
 # ── TRADE PAIRING & P&L ──────────────────────────────────────────────────────
 def _group_fills(fills):
