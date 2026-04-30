@@ -237,17 +237,22 @@ def get_today_fills():
     return aGet("/v2/account/activities/FILL",
                 params={"after": after, "direction": "asc", "page_size": 100}) or []
 
-# ── TRADE PAIRING & P&L ──────────────────────────────────────────────────────
-def compute_trades_and_pnl(fills):
-    """
-    Group fills by order_id → trades.
-    FIFO match buys/sells per symbol → realized P&L + W/L.
-    Returns (trades_list, wins, losses, realized_pnl).
-    """
-    if not fills:
-        return [], 0, 0, 0.0
+def get_recent_fills(days=7):
+    """Get fills from the past N days — used for cross-day FIFO matching
+    so swing trades that close today get correctly counted as wins/losses
+    even though their original buy was on a prior day."""
+    now_et = datetime.now(ET)
+    today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    after_dt = today_start - timedelta(days=days)
+    after = after_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return aGet("/v2/account/activities/FILL",
+                params={"after": after, "direction": "asc", "page_size": 500}) or []
 
-    # Group partial fills under one trade per order
+# ── TRADE PAIRING & P&L ──────────────────────────────────────────────────────
+def _group_fills(fills):
+    """Group partial fills by order_id → list of trades, sorted by time."""
+    if not fills:
+        return []
     by_order = {}
     for f in fills:
         oid = f.get("order_id", "")
@@ -255,11 +260,12 @@ def compute_trades_and_pnl(fills):
             continue
         if oid not in by_order:
             by_order[oid] = {
-                "sym":  f.get("symbol", ""),
-                "side": f.get("side", ""),
-                "qty":  0.0,
+                "order_id": oid,
+                "sym":   f.get("symbol", ""),
+                "side":  f.get("side", ""),
+                "qty":   0.0,
                 "value": 0.0,
-                "time": (f.get("transaction_time", "") or "")[:19].replace("T", " "),
+                "time":  (f.get("transaction_time", "") or "")[:19].replace("T", " "),
             }
         try:
             q = float(f.get("qty", 0))
@@ -269,29 +275,62 @@ def compute_trades_and_pnl(fills):
         by_order[oid]["qty"]   += q
         by_order[oid]["value"] += q * p
 
-    trades = []
-    for oid, t in by_order.items():
+    out = []
+    for t in by_order.values():
         if t["qty"] > 0:
-            trades.append({
+            out.append({
+                "order_id": t["order_id"],
                 "sym":   t["sym"],
                 "side":  t["side"],
                 "qty":   int(t["qty"]) if t["qty"] == int(t["qty"]) else round(t["qty"], 4),
                 "price": round(t["value"] / t["qty"], 2),
                 "time":  t["time"],
             })
-    trades.sort(key=lambda x: x["time"])
+    out.sort(key=lambda x: x["time"])
+    return out
 
-    # FIFO match per symbol
+def compute_trades_and_pnl(today_fills, lookback_fills=None):
+    """
+    Compute trades for display + W/L + realized P&L.
+
+    today_fills:    fills from today (used for display + identifying today's sells)
+    lookback_fills: optional wider window of fills used for FIFO matching
+                    so swing trades closing today get counted correctly
+                    (their original buy was on a prior day).
+                    If None, defaults to today_fills (no cross-day matching).
+
+    Returns (display_trades, today_wins, today_losses, today_realized_pnl).
+    """
+    if lookback_fills is None:
+        lookback_fills = today_fills
+
+    if not today_fills and not lookback_fills:
+        return [], 0, 0, 0.0
+
+    # Order IDs from today — used to decide which matched sells "count" for today
+    today_order_ids = {f.get("order_id", "") for f in today_fills if f.get("order_id")}
+
+    today_trades = _group_fills(today_fills)
+    all_trades   = _group_fills(lookback_fills)
+
+    # Display trades (today only) — strip internal order_id
+    display = [{k: v for k, v in t.items() if k != "order_id"} for t in today_trades]
+
+    # FIFO match per symbol across the full lookback window
     by_sym = {}
-    for t in trades:
-        s = t["sym"]
-        by_sym.setdefault(s, {"buys": [], "sells": []})
+    for t in all_trades:
+        sym = t["sym"]
+        by_sym.setdefault(sym, {"buys": [], "sells": []})
         bucket = "buys" if t["side"] == "buy" else "sells"
-        by_sym[s][bucket].append({"qty": float(t["qty"]), "price": t["price"]})
+        by_sym[sym][bucket].append({
+            "qty":      float(t["qty"]),
+            "price":    t["price"],
+            "order_id": t["order_id"],
+        })
 
-    wins = 0
-    losses = 0
-    realized = 0.0
+    today_w = 0
+    today_l = 0
+    today_realized = 0.0
     for sym, data in by_sym.items():
         buys = [{"qty": b["qty"], "price": b["price"]} for b in data["buys"]]
         for sell in data["sells"]:
@@ -306,15 +345,16 @@ def compute_trades_and_pnl(fills):
                 matched_qty += take
                 buy["qty"] -= take
                 qty_left  -= take
-            if matched_qty > 0:
+            # Only count toward TODAY when this sell happened today
+            if matched_qty > 0 and sell["order_id"] in today_order_ids:
                 pnl = (sell["price"] * matched_qty) - cost_basis
-                realized += pnl
+                today_realized += pnl
                 if pnl > 0:
-                    wins += 1
+                    today_w += 1
                 else:
-                    losses += 1
+                    today_l += 1
 
-    return trades, wins, losses, round(realized, 2)
+    return display, today_w, today_l, round(today_realized, 2)
 
 # ── DASHBOARD DATA — single source of truth ──────────────────────────────────
 class DataSnapshot:
@@ -327,7 +367,8 @@ class DataSnapshot:
         self.positions = []
         self.orders = []
         self.clock = {}
-        self.fills = []
+        self.fills = []           # today's fills (for display)
+        self.lookback_fills = []  # past 7 days (for cross-day FIFO matching)
         self.errors = []  # what failed during fetch
 
     def fetch(self):
@@ -356,11 +397,17 @@ class DataSnapshot:
         except Exception as e:
             self.errors.append(f"clock: {e}")
 
-        # Fills (today only)
+        # Fills (today only — for display)
         try:
             self.fills = get_today_fills()
         except Exception as e:
             self.errors.append(f"fills: {e}")
+
+        # Recent fills (past 7 days — for cross-day FIFO matching of swing closes)
+        try:
+            self.lookback_fills = get_recent_fills(days=7)
+        except Exception as e:
+            self.errors.append(f"lookback_fills: {e}")
 
         return self
 
@@ -370,7 +417,7 @@ _snap_lock = threading.Lock()
 _snap_data = {"snap": None, "ts": None}
 
 # Last-known-good values per piece — used when a single fetch fails
-_last_good = {"acct": {}, "positions": [], "orders": [], "clock": {}, "fills": []}
+_last_good = {"acct": {}, "positions": [], "orders": [], "clock": {}, "fills": [], "lookback_fills": []}
 _last_good_lock = threading.Lock()
 
 def get_snapshot(max_age_s=8):
@@ -403,6 +450,10 @@ def get_snapshot(max_age_s=8):
             if snap.fills: _last_good["fills"] = snap.fills
         else:
             snap.fills = list(_last_good["fills"])
+        if snap.lookback_fills or not any('lookback_fills' in e for e in snap.errors):
+            if snap.lookback_fills: _last_good["lookback_fills"] = snap.lookback_fills
+        else:
+            snap.lookback_fills = list(_last_good["lookback_fills"])
 
     with _snap_lock:
         _snap_data["snap"] = snap
@@ -832,13 +883,18 @@ def bot_loop():
             time.sleep(60)
 
 def keepalive_loop():
+    """Ping self every 4.5min to prevent Render sleep + give visible proof of life."""
     time.sleep(120)
     while True:
         try:
             if KEEPALIVE:
                 requests.get(KEEPALIVE, timeout=10)
-        except Exception:
-            pass
+                push_alert("💓 Keepalive ping sent", "info")
+            else:
+                # No KEEPALIVE URL set — at least log that we're alive
+                push_alert("💓 Bot heartbeat (no keepalive URL configured)", "info")
+        except Exception as e:
+            push_alert(f"⚠️ Keepalive failed: {e}", "warning")
         time.sleep(270)
 
 def snapshot_loop():
@@ -875,9 +931,10 @@ def api_data():
     orders = snap.orders or []
     clock = snap.clock or {}
     fills = snap.fills or []
+    lookback_fills = snap.lookback_fills or []
 
-    # Compute trades + realized P&L from fills
-    trades, wins, losses, realized = compute_trades_and_pnl(fills)
+    # Compute trades + realized P&L from fills (cross-day matching for swing closes)
+    trades, wins, losses, realized = compute_trades_and_pnl(fills, lookback_fills)
 
     # Account values
     try:
