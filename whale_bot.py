@@ -1073,6 +1073,13 @@ def api_data():
         health = dict(_state["health"])
     win_rate = round(tw / tt * 100, 1) if tt else 0.0
 
+    # Period P&L: use cached week/month/year (they move slowly), but always
+    # use LIVE daily so it matches the main Today's P&L card. Otherwise the
+    # cached daily can lag by up to 5 minutes and confuse the user.
+    pp = dict(snap.period_pnl) if snap.period_pnl else {}
+    pp["daily"] = daily_pnl
+    pp["daily_pct"] = round(daily_pnl / last_eq * 100, 2) if last_eq else 0.0
+
     return jsonify({
         "ok":             True,
         "live_mode":      LIVE_MODE,
@@ -1102,7 +1109,7 @@ def api_data():
         "traded_today":   traded,
         "lost_today":     lost,
         "goal":           DAILY_GOAL,
-        "period_pnl":     snap.period_pnl or {},
+        "period_pnl":     pp,
         "snapshot_errors": snap.errors,
         "health":         health,
         "snapshot_age_s": ((datetime.now(ET) - _snap_data["ts"]).total_seconds()
@@ -1308,6 +1315,9 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
 .plabel{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--dim);margin-bottom:4px}
 .pval{font-family:var(--mono);font-size:18px;color:#fff;margin-bottom:2px}
 .ppct{font-family:var(--mono);font-size:10px;color:var(--dim)}
+/* Higher-specificity overrides so .g/.r colors win over .pval/.ppct defaults */
+.pval.g,.ppct.g{color:var(--green)}
+.pval.r,.ppct.r{color:var(--red)}
 </style>
 </head>
 <body>
