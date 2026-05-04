@@ -895,6 +895,102 @@ def monitor():
     except Exception:
         pass
 
+def protect_positions():
+    """
+    Verify every open position has a stop-loss and take-profit order.
+    If a position is unprotected (e.g. day-trade brackets expired overnight),
+    re-place fresh SL/TP as GTC orders so the position can never sit naked.
+
+    Runs at market open + periodically through the day. Idempotent — safe to
+    call repeatedly. Skips positions that already have both legs in place.
+    """
+    try:
+        positions = get_positions()
+        if not positions:
+            return
+
+        # Get all open orders, group by symbol+side
+        try:
+            open_orders = get_orders_open()
+        except Exception as e:
+            push_alert(f"⚠️ Protection check: can't fetch orders ({e})", "warning")
+            return
+
+        protected_per_sym = {}  # sym -> {"stop": bool, "limit": bool}
+        for o in open_orders:
+            sym = o.get("symbol", "")
+            side = o.get("side", "")
+            otype = (o.get("order_type") or o.get("type") or "").lower()
+            # Closing orders: sell for long, buy for short
+            if not sym:
+                continue
+            d = protected_per_sym.setdefault(sym, {"stop": False, "limit": False})
+            if "stop" in otype:
+                d["stop"] = True
+            elif "limit" in otype:
+                d["limit"] = True
+
+        for p in positions:
+            sym = p.get("symbol", "")
+            try:
+                qty = abs(int(float(p.get("qty", 0))))
+                entry = float(p.get("avg_entry_price", 0))
+                side = p.get("side", "long")  # 'long' or 'short'
+            except (TypeError, ValueError):
+                continue
+            if qty == 0 or entry <= 0:
+                continue
+
+            prot = protected_per_sym.get(sym, {"stop": False, "limit": False})
+            close_side = "sell" if side == "long" else "buy"
+
+            # Compute fresh SL/TP from entry price
+            if side == "long":
+                sl_price = round(entry * (1 - STOP_PCT), 2)
+                tp_price = round(entry * (1 + TARGET_PCT), 2)
+            else:
+                sl_price = round(entry * (1 + STOP_PCT), 2)
+                tp_price = round(entry * (1 - TARGET_PCT), 2)
+
+            placed_any = False
+
+            if not prot["stop"]:
+                try:
+                    aPost("/v2/orders", {
+                        "symbol": sym,
+                        "qty": str(qty),
+                        "side": close_side,
+                        "type": "stop",
+                        "stop_price": str(sl_price),
+                        "time_in_force": "gtc",
+                    })
+                    push_alert(f"🛡️ Re-placed STOP for {sym}: {close_side.upper()} {qty} @ ${sl_price} GTC", "warning")
+                    placed_any = True
+                except Exception as e:
+                    push_alert(f"⚠️ Failed to place STOP for {sym}: {e}", "error")
+
+            if not prot["limit"]:
+                try:
+                    aPost("/v2/orders", {
+                        "symbol": sym,
+                        "qty": str(qty),
+                        "side": close_side,
+                        "type": "limit",
+                        "limit_price": str(tp_price),
+                        "time_in_force": "gtc",
+                    })
+                    push_alert(f"🎯 Re-placed TP for {sym}: {close_side.upper()} {qty} @ ${tp_price} GTC", "warning")
+                    placed_any = True
+                except Exception as e:
+                    push_alert(f"⚠️ Failed to place TP for {sym}: {e}", "error")
+
+            if not placed_any and (prot["stop"] and prot["limit"]):
+                # Already fully protected — silent (don't spam log)
+                pass
+
+    except Exception as e:
+        push_alert(f"⚠️ protect_positions error: {e}", "error")
+
 def eod():
     monitor()
     push_alert("🔔 EOD report", "info")
@@ -925,6 +1021,15 @@ def bot_loop():
 
     time.sleep(8)
 
+    # Startup: if there are existing positions (e.g. from prior session),
+    # immediately verify they're protected. Critical for live trading.
+    try:
+        if get_positions():
+            push_alert("🛡️ Startup: checking position protection…", "info")
+            protect_positions()
+    except Exception as e:
+        push_alert(f"⚠️ Startup protection check err: {e}", "warning")
+
     # Startup scan if open
     try:
         if get_clock().get("is_open"):
@@ -946,7 +1051,7 @@ def bot_loop():
 
             schedule = {
                 "8:00":  lambda: job("PREMARKET 8AM"),
-                "9:30":  lambda: job("OPENING RANGE"),
+                "9:30":  lambda: (protect_positions(), job("OPENING RANGE")),  # protect first
                 "9:45":  lambda: job("ORB BREAKOUT"),
                 "10:00": lambda: job("MOMENTUM 10AM"),
                 "12:00": lambda: job("MIDDAY"),
@@ -960,6 +1065,14 @@ def bot_loop():
             elif 8 <= h < 16 and m in (0, 30) and f"news_{key}" not in triggered:
                 fetch_news()
                 triggered.add(f"news_{key}")
+            elif 9 <= h < 16 and m % 10 == 0 and f"protect_{key}" not in triggered:
+                # Protection sweep every 10 minutes during session — catches
+                # any position that lost its bracket legs for any reason
+                try:
+                    protect_positions()
+                except Exception as e:
+                    push_alert(f"⚠️ Protection sweep err: {e}", "warning")
+                triggered.add(f"protect_{key}")
             elif 9 <= h < 16 and m % 2 == 0 and key not in triggered:
                 try:
                     monitor()
@@ -1200,6 +1313,17 @@ def api_estop():
         pass
     push_alert("🛑 EMERGENCY STOP", "error")
     return jsonify({"ok": True})
+
+@app.route("/api/protect", methods=["POST"])
+def api_protect():
+    """Manually trigger position protection check. Re-places missing SL/TP as GTC."""
+    if not authed():
+        return jsonify({"error": "Wrong password"}), 401
+    try:
+        protect_positions()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/close/<sym>", methods=["POST"])
 def api_close(sym):
