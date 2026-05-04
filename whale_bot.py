@@ -897,51 +897,71 @@ def monitor():
 
 def protect_positions():
     """
-    Verify every open position has a stop-loss and take-profit order.
-    If a position is unprotected (e.g. day-trade brackets expired overnight),
-    re-place fresh SL/TP as GTC orders so the position can never sit naked.
+    Verify every open position has both stop-loss and take-profit protection.
+    If a position is unprotected or only partially protected, place a fresh
+    OCO (One-Cancels-Other) order with both legs as GTC.
 
-    Runs at market open + periodically through the day. Idempotent — safe to
-    call repeatedly. Skips positions that already have both legs in place.
+    Why OCO instead of two separate orders:
+      Alpaca rejects two independent sell-to-close orders for the same shares
+      with HTTP 403 (wash-trade prevention). OCO bundles SL + TP as ONE order
+      so Alpaca's risk engine accepts it. When one leg fills, the other auto-cancels.
+
+    Algorithm:
+      1. Scan open orders per symbol — count protective legs (stop + limit)
+      2. If position already has BOTH protective legs → leave alone (idempotent)
+      3. Otherwise:
+         a. Cancel any existing solo close orders for that symbol (frees up shares)
+         b. Place fresh OCO with both legs as GTC
+
+    Runs at market open + periodically through the session. Safe to call repeatedly.
     """
     try:
         positions = get_positions()
         if not positions:
             return
 
-        # Get all open orders, group by symbol+side
         try:
             open_orders = get_orders_open()
         except Exception as e:
             push_alert(f"⚠️ Protection check: can't fetch orders ({e})", "warning")
             return
 
-        protected_per_sym = {}  # sym -> {"stop": bool, "limit": bool}
+        # Group existing close orders per symbol: stop count, limit count, ids
+        by_sym = {}
         for o in open_orders:
             sym = o.get("symbol", "")
-            side = o.get("side", "")
             otype = (o.get("order_type") or o.get("type") or "").lower()
-            # Closing orders: sell for long, buy for short
-            if not sym:
+            oside = o.get("side", "")
+            oid = o.get("id", "")
+            if not sym or not oid:
                 continue
-            d = protected_per_sym.setdefault(sym, {"stop": False, "limit": False})
+            d = by_sym.setdefault(sym, {"stops": [], "limits": [], "all_close": []})
+            # Track all sell/buy-to-close orders for this symbol
+            d["all_close"].append({"id": oid, "side": oside, "type": otype})
             if "stop" in otype:
-                d["stop"] = True
+                d["stops"].append(oid)
             elif "limit" in otype:
-                d["limit"] = True
+                d["limits"].append(oid)
 
         for p in positions:
             sym = p.get("symbol", "")
             try:
                 qty = abs(int(float(p.get("qty", 0))))
                 entry = float(p.get("avg_entry_price", 0))
-                side = p.get("side", "long")  # 'long' or 'short'
+                side = p.get("side", "long")
             except (TypeError, ValueError):
                 continue
             if qty == 0 or entry <= 0:
                 continue
 
-            prot = protected_per_sym.get(sym, {"stop": False, "limit": False})
+            existing = by_sym.get(sym, {"stops": [], "limits": [], "all_close": []})
+            has_stop = len(existing["stops"]) > 0
+            has_limit = len(existing["limits"]) > 0
+
+            # If both legs already exist, position is fully protected — skip
+            if has_stop and has_limit:
+                continue
+
             close_side = "sell" if side == "long" else "buy"
 
             # Compute fresh SL/TP from entry price
@@ -952,41 +972,42 @@ def protect_positions():
                 sl_price = round(entry * (1 + STOP_PCT), 2)
                 tp_price = round(entry * (1 - TARGET_PCT), 2)
 
-            placed_any = False
-
-            if not prot["stop"]:
+            # Cancel any existing solo close orders for this symbol — frees up
+            # the shares so the OCO can be accepted (Alpaca blocks duplicates)
+            cancelled = 0
+            for o in existing["all_close"]:
+                # Only cancel orders going the same direction as our close
+                if o["side"] != close_side:
+                    continue
                 try:
-                    aPost("/v2/orders", {
-                        "symbol": sym,
-                        "qty": str(qty),
-                        "side": close_side,
-                        "type": "stop",
-                        "stop_price": str(sl_price),
-                        "time_in_force": "gtc",
-                    })
-                    push_alert(f"🛡️ Re-placed STOP for {sym}: {close_side.upper()} {qty} @ ${sl_price} GTC", "warning")
-                    placed_any = True
+                    aDel(f"/v2/orders/{o['id']}")
+                    cancelled += 1
                 except Exception as e:
-                    push_alert(f"⚠️ Failed to place STOP for {sym}: {e}", "error")
+                    log.debug(f"cancel {o['id']}: {e}")
 
-            if not prot["limit"]:
-                try:
-                    aPost("/v2/orders", {
-                        "symbol": sym,
-                        "qty": str(qty),
-                        "side": close_side,
-                        "type": "limit",
-                        "limit_price": str(tp_price),
-                        "time_in_force": "gtc",
-                    })
-                    push_alert(f"🎯 Re-placed TP for {sym}: {close_side.upper()} {qty} @ ${tp_price} GTC", "warning")
-                    placed_any = True
-                except Exception as e:
-                    push_alert(f"⚠️ Failed to place TP for {sym}: {e}", "error")
+            if cancelled:
+                push_alert(f"🧹 Cancelled {cancelled} solo close order(s) for {sym} to place OCO", "info")
+                # Brief wait so Alpaca processes the cancellations before OCO
+                time.sleep(0.5)
 
-            if not placed_any and (prot["stop"] and prot["limit"]):
-                # Already fully protected — silent (don't spam log)
-                pass
+            # Place OCO — single order with both legs
+            try:
+                aPost("/v2/orders", {
+                    "symbol": sym,
+                    "qty": str(qty),
+                    "side": close_side,
+                    "type": "limit",
+                    "limit_price": str(tp_price),
+                    "time_in_force": "gtc",
+                    "order_class": "oco",
+                    "stop_loss":   {"stop_price":  str(sl_price)},
+                    "take_profit": {"limit_price": str(tp_price)},
+                })
+                push_alert(
+                    f"🛡️ OCO protection for {sym}: {close_side.upper()} {qty} | "
+                    f"SL ${sl_price} / TP ${tp_price} GTC", "warning")
+            except Exception as e:
+                push_alert(f"⚠️ Failed to place OCO for {sym}: {e}", "error")
 
     except Exception as e:
         push_alert(f"⚠️ protect_positions error: {e}", "error")
