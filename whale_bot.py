@@ -55,6 +55,10 @@ MIN_PRICE    = float(os.environ.get("MIN_PRICE",    "10.0"))
 MAX_DT       = int(os.environ.get("MAX_DAY_TRADES", "2"))
 MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 
+# Anti-overtrade controls (added after live-day churning incident May 4 2026)
+COOLDOWN_MIN       = int(os.environ.get("SYMBOL_COOLDOWN_MIN", "30"))   # min between same-symbol entries
+MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "5"))     # hard cap on round-trips/day
+
 LIVE_MODE = "paper" not in BASE_URL.lower()
 ET = pytz.timezone("America/New_York")
 UTC = pytz.UTC
@@ -118,6 +122,10 @@ _state = {
     "news_tickers": [],
     "traded_today": [],
     "lost_today": [],
+    # Anti-overtrade tracking — populated by update_closed_trade_state()
+    "bot_dt_count": 0,            # round-trip day trades the bot itself executed today
+    "completed_trades_today": 0,  # total closed positions today (round trips)
+    "sym_cooldown": {},           # sym -> ISO timestamp until cooldown ends
     "tracker": {
         "date": str(date.today()),
         "wins_today": 0,
@@ -442,6 +450,101 @@ def compute_trades_and_pnl(today_fills, lookback_fills=None):
                     today_l += 1
 
     return display, today_w, today_l, round(today_realized, 2)
+
+def update_closed_trade_state(today_fills, lookback_fills=None):
+    """
+    Walk through today's closed positions (via FIFO matching) and update
+    anti-overtrade state:
+      - lost_today: symbols that had a same-day close at a loss → block re-entry
+      - sym_cooldown: timestamp when a symbol becomes available again (any close)
+      - bot_dt_count: count of round-trip day trades (both legs today)
+      - completed_trades_today: total closed positions today
+
+    Called after every FIFO computation (in the snapshot loop) so guards in
+    execute() always reflect current reality. Idempotent — recomputes from
+    fills each time, doesn't depend on accumulated event handling.
+    """
+    if lookback_fills is None:
+        lookback_fills = today_fills
+    if not today_fills and not lookback_fills:
+        return
+
+    today_order_ids = {f.get("order_id", "") for f in today_fills if f.get("order_id")}
+    all_trades = _group_fills(lookback_fills)
+
+    # Group by symbol with order_id + time
+    by_sym = {}
+    for t in all_trades:
+        sym = t["sym"]
+        by_sym.setdefault(sym, {"buys": [], "sells": []})
+        bucket = "buys" if t["side"] == "buy" else "sells"
+        by_sym[sym][bucket].append({
+            "qty":      float(t["qty"]),
+            "price":    t["price"],
+            "order_id": t["order_id"],
+            "time":     t["time"],
+        })
+
+    new_lost = set()
+    new_cooldown = {}  # sym -> latest sell time (we'll compute cooldown end from this)
+    bot_dt = 0
+    completed = 0
+
+    for sym, data in by_sym.items():
+        buys = [{"qty": b["qty"], "price": b["price"], "order_id": b["order_id"]}
+                for b in data["buys"]]
+        for sell in sorted(data["sells"], key=lambda x: x["time"]):
+            qty_left = sell["qty"]
+            cost_basis = 0.0
+            matched_qty = 0.0
+            buy_was_today = False
+            for buy in buys:
+                if qty_left <= 0 or buy["qty"] <= 0:
+                    continue
+                take = min(qty_left, buy["qty"])
+                cost_basis += take * buy["price"]
+                matched_qty += take
+                if buy["order_id"] in today_order_ids:
+                    buy_was_today = True
+                buy["qty"] -= take
+                qty_left -= take
+
+            if matched_qty > 0 and sell["order_id"] in today_order_ids:
+                # This sell closed (or partly closed) a position TODAY
+                completed += 1
+                if buy_was_today:
+                    bot_dt += 1  # round-trip day trade
+                pnl = (sell["price"] * matched_qty) - cost_basis
+                if pnl < 0:
+                    new_lost.add(sym)
+                # Track latest sell time per symbol — used for cooldown
+                prev = new_cooldown.get(sym, "")
+                if sell["time"] > prev:
+                    new_cooldown[sym] = sell["time"]
+
+    # Convert cooldown sell-times → ET-aware "available again at" timestamps
+    cooldown_until = {}
+    now = datetime.now(ET)
+    for sym, sell_time_str in new_cooldown.items():
+        try:
+            # sell_time_str format is "YYYY-MM-DD HH:MM:SS" in UTC (from fill records)
+            sold_utc = datetime.strptime(sell_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            cooldown_end = sold_utc + timedelta(minutes=COOLDOWN_MIN)
+            # Only keep if cooldown hasn't expired yet
+            if cooldown_end > now.astimezone(UTC):
+                cooldown_until[sym] = cooldown_end.astimezone(ET).isoformat()
+        except Exception:
+            # Fallback: cooldown from now
+            cooldown_until[sym] = (now + timedelta(minutes=COOLDOWN_MIN)).isoformat()
+
+    with _lock:
+        # Add newly-lost symbols (don't remove existing — losses are sticky for the day)
+        for s in new_lost:
+            if s not in _state["lost_today"]:
+                _state["lost_today"].append(s)
+        _state["bot_dt_count"] = bot_dt
+        _state["completed_trades_today"] = completed
+        _state["sym_cooldown"] = cooldown_until
 
 # ── DASHBOARD DATA — single source of truth ──────────────────────────────────
 class DataSnapshot:
@@ -828,6 +931,9 @@ def reset_if_new_day():
             _state["traded_today"] = []
             _state["lost_today"]   = []
             _state["news_tickers"] = []
+            _state["bot_dt_count"] = 0
+            _state["completed_trades_today"] = 0
+            _state["sym_cooldown"] = {}
 
 def execute(setups, label=""):
     reset_if_new_day()
@@ -839,15 +945,65 @@ def execute(setups, label=""):
     if not setups:
         return
 
-    dt_used = get_dt_used()
+    # ── HARD CAP: total trades today ─────────────────────────────────
+    # Stops runaway churning regardless of symbol or P&L
+    with _lock:
+        completed = _state.get("completed_trades_today", 0)
+    if completed >= MAX_TRADES_PER_DAY:
+        push_alert(
+            f"🛑 Daily trade cap reached ({completed}/{MAX_TRADES_PER_DAY}) — "
+            f"no new trades today. Bot will resume tomorrow.", "warning")
+        return
+
+    # ── DAY TRADE LIMIT ──────────────────────────────────────────────
+    # Use whichever counter is higher (Alpaca's or bot's own count) so
+    # this works even on accounts where Alpaca doesn't enforce PDT.
+    alpaca_dt = get_dt_used()
+    with _lock:
+        bot_dt = _state.get("bot_dt_count", 0)
+    dt_used = max(alpaca_dt, bot_dt)
     pdt_maxed = dt_used >= MAX_DT
     if pdt_maxed:
-        push_alert(f"⚠️ PDT {dt_used}/{MAX_DT} — swing only", "warning")
+        push_alert(
+            f"⚠️ Day trade limit ({dt_used}/{MAX_DT}) — swing only", "warning")
 
+    # ── FILTER: skip lost symbols + cooldowns ────────────────────────
     with _lock:
-        lost = list(_state["lost_today"])
-    filtered = [s for s in setups if s["sym"] not in lost]
+        lost = list(_state.get("lost_today", []))
+        cooldowns = dict(_state.get("sym_cooldown", {}))
+    now = datetime.now(ET)
+
+    def is_blocked(sym):
+        if sym in lost:
+            return f"already lost on {sym} today"
+        cd = cooldowns.get(sym)
+        if cd:
+            try:
+                cd_dt = datetime.fromisoformat(cd)
+                if cd_dt > now:
+                    mins_left = int((cd_dt - now).total_seconds() / 60) + 1
+                    return f"{sym} on cooldown ({mins_left} min left)"
+            except Exception:
+                pass
+        return None
+
+    filtered = []
+    for s in setups:
+        reason = is_blocked(s["sym"])
+        if reason:
+            log.debug(f"Skip {s['sym']}: {reason}")
+            continue
+        filtered.append(s)
+
     if not filtered:
+        # Show user why no trades are firing
+        blocked_msgs = []
+        for s in setups[:3]:
+            reason = is_blocked(s["sym"])
+            if reason:
+                blocked_msgs.append(reason)
+        if blocked_msgs:
+            push_alert(f"📊 All setups blocked: {'; '.join(blocked_msgs[:2])}", "info")
         return
 
     best = filtered[0]
@@ -871,10 +1027,10 @@ def execute(setups, label=""):
     if best["tier"] == 3:
         ok = place_order(best, swing=pdt_maxed)
     elif pdt_maxed and best["score"] >= 65:
-        push_alert(f"🔄 PDT maxed — SWING: {best['sym']}", "warning")
+        push_alert(f"🔄 Day trade limit — SWING: {best['sym']}", "warning")
         ok = place_order(best, swing=True)
     elif pdt_maxed:
-        push_alert(f"🛑 PDT maxed + low score — skip {best['sym']}", "warning")
+        push_alert(f"🛑 DT maxed + low score — skip {best['sym']}", "warning")
         return
     elif best["score"] >= MIN_SCORE:
         ok = place_order(best, swing=False)
@@ -885,6 +1041,13 @@ def execute(setups, label=""):
         with _lock:
             if best["sym"] not in _state["traded_today"]:
                 _state["traded_today"].append(best["sym"])
+            # Pre-emptively set a cooldown immediately on entry so we don't
+            # buy the same symbol again before its OCO closes (otherwise the
+            # next continuous scan could re-enter while position is still open
+            # if there's any race condition).
+            _state["sym_cooldown"][best["sym"]] = (
+                datetime.now(ET) + timedelta(minutes=COOLDOWN_MIN)
+            ).isoformat()
 
 def monitor():
     try:
@@ -1169,6 +1332,10 @@ def api_data():
     # Compute trades + realized P&L from fills (cross-day matching for swing closes)
     trades, wins, losses, realized = compute_trades_and_pnl(fills, lookback_fills)
 
+    # Update anti-overtrade state from the same fill data (lost_today,
+    # cooldowns, bot day-trade count, total completed trades)
+    update_closed_trade_state(fills, lookback_fills)
+
     # Account values
     try:
         equity = float(acct.get("equity", 0))
@@ -1204,6 +1371,9 @@ def api_data():
         alerts = list(_state["alerts"])
         traded = list(_state["traded_today"])
         lost   = list(_state["lost_today"])
+        bot_dt_count = _state.get("bot_dt_count", 0)
+        completed_today = _state.get("completed_trades_today", 0)
+        cooldowns = dict(_state.get("sym_cooldown", {}))
         health = dict(_state["health"])
     win_rate = round(tw / tt * 100, 1) if tt else 0.0
 
@@ -1244,6 +1414,11 @@ def api_data():
         "lost_today":     lost,
         "goal":           DAILY_GOAL,
         "period_pnl":     pp,
+        "bot_dt_count":   bot_dt_count,
+        "completed_today": completed_today,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "sym_cooldown":   cooldowns,
+        "cooldown_min":   COOLDOWN_MIN,
         "snapshot_errors": snap.errors,
         "health":         health,
         "snapshot_age_s": ((datetime.now(ET) - _snap_data["ts"]).total_seconds()
