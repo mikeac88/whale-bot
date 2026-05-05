@@ -618,7 +618,7 @@ _last_good = {"acct": {}, "positions": [], "orders": [], "clock": {}, "fills": [
               "lookback_fills": [], "period_pnl": {}}
 _last_good_lock = threading.Lock()
 
-def get_snapshot(max_age_s=8):
+def get_snapshot(max_age_s=4):
     """Get cached snapshot if fresh, else refetch."""
     now = datetime.now(ET)
     with _snap_lock:
@@ -1294,7 +1294,8 @@ def keepalive_loop():
         time.sleep(270)
 
 def snapshot_loop():
-    """Refresh dashboard snapshot every 8s in background — keeps mobile fast."""
+    """Refresh dashboard snapshot every 4s in background — keeps mobile fast.
+    The cache TTL in get_snapshot() matches this interval to avoid double-fetching."""
     time.sleep(2)
     while True:
         try:
@@ -1304,7 +1305,7 @@ def snapshot_loop():
                 _snap_data["ts"] = datetime.now(ET)
         except Exception as e:
             log.debug(f"snap loop: {e}")
-        time.sleep(8)
+        time.sleep(4)
 
 # ── FLASK APP ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -2038,8 +2039,35 @@ async function loadLogs() {
 // ── start ──────────────────────────────────────────────────────
 loadData();
 loadLogs();
-setInterval(loadData, 5000);
-setInterval(loadLogs, 10000);
+
+// Polling intervals
+let dataInterval = setInterval(loadData, 2000);
+let logsInterval = setInterval(loadLogs, 5000);
+
+// Visibility-aware refresh: when tab becomes visible (user switches back
+// to it, unlocks phone, etc), immediately refresh and resume polling.
+// Fixes mobile browser timer throttling — without this, you'd see stale
+// data after locking your phone for a few minutes.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    // Force immediate refresh when page becomes visible
+    loadData();
+    loadLogs();
+  }
+});
+
+// Pulse the LIVE indicator each time fresh data arrives
+const origRender = renderData;
+renderData = function(d) {
+  origRender(d);
+  // Briefly flash the snapshot age indicator green to show fresh data
+  const snap = $('h-snap');
+  if (snap) {
+    snap.style.transition = 'color 0.15s';
+    snap.style.color = 'var(--green)';
+    setTimeout(() => { snap.style.color = ''; }, 200);
+  }
+};
 </script>
 </body>
 </html>
