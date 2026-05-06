@@ -126,6 +126,9 @@ _state = {
     "bot_dt_count": 0,            # round-trip day trades the bot itself executed today
     "completed_trades_today": 0,  # total closed positions today (round trips)
     "sym_cooldown": {},           # sym -> ISO timestamp until cooldown ends
+    # Visibility into what the bot considered today (helps debug "why no trades")
+    "best_score_today": 0,
+    "best_setup_today": None,
     "tracker": {
         "date": str(date.today()),
         "wins_today": 0,
@@ -849,6 +852,23 @@ def full_scan(label="SCAN"):
     setups.sort(key=lambda x: (x["tier"], x["score"]), reverse=True)
     top = setups[:5]
 
+    # Track best setup observed today so user can see what the bot considered
+    # even when no trades fired (useful for debugging "why didn't it trade")
+    if top:
+        new_best = top[0]
+        with _lock:
+            current_best_score = _state.get("best_score_today", 0)
+            if new_best["score"] > current_best_score:
+                _state["best_score_today"] = new_best["score"]
+                _state["best_setup_today"] = {
+                    "sym":   new_best["sym"],
+                    "score": new_best["score"],
+                    "tier":  new_best["tier"],
+                    "chg":   new_best["chg"],
+                    "vol":   new_best["vol"],
+                    "time":  _now_et_str(),
+                }
+
     if top:
         lines = [f"✅ {label} | {regime_label} | {len(setups)} setups"]
         for i, s in enumerate(top[:3]):
@@ -934,6 +954,8 @@ def reset_if_new_day():
             _state["bot_dt_count"] = 0
             _state["completed_trades_today"] = 0
             _state["sym_cooldown"] = {}
+            _state["best_score_today"] = 0
+            _state["best_setup_today"] = None
 
 def execute(setups, label=""):
     reset_if_new_day()
@@ -1024,13 +1046,24 @@ def execute(setups, label=""):
     tag = "🚨EXTREME" if best["tier"] == 3 else "🐋WHALE" if best["tier"] >= 1 else "📊"
     push_alert(f"{tag} {best['dir']} {best['sym']} | Score:{best['score']} | {best['chg']:+.1f}% | Vol:{best['vol']}x", "info")
 
+    # Compute effective threshold based on regime — same logic as scanner so
+    # any setup that PASSED the scan can fire as a swing when DT is maxed.
+    # Previously this was hardcoded to 65, which was stricter than the
+    # bear-day scan threshold (45). Result: bot would scan, find setups,
+    # then refuse to trade them. Now: scan threshold == trade threshold.
+    try:
+        regime_ok, _ = market_regime()
+    except Exception:
+        regime_ok = True
+    effective_threshold = MIN_SCORE if regime_ok else max(MIN_SCORE - 10, 40)
+
     if best["tier"] == 3:
         ok = place_order(best, swing=pdt_maxed)
-    elif pdt_maxed and best["score"] >= 65:
-        push_alert(f"🔄 Day trade limit — SWING: {best['sym']}", "warning")
+    elif pdt_maxed and best["score"] >= effective_threshold:
+        push_alert(f"🔄 Day trade limit — SWING: {best['sym']} (score {best['score']} ≥ {effective_threshold})", "warning")
         ok = place_order(best, swing=True)
     elif pdt_maxed:
-        push_alert(f"🛑 DT maxed + low score — skip {best['sym']}", "warning")
+        push_alert(f"🛑 DT maxed + score {best['score']} below threshold {effective_threshold} — skip {best['sym']}", "warning")
         return
     elif best["score"] >= MIN_SCORE:
         ok = place_order(best, swing=False)
@@ -1375,6 +1408,8 @@ def api_data():
         bot_dt_count = _state.get("bot_dt_count", 0)
         completed_today = _state.get("completed_trades_today", 0)
         cooldowns = dict(_state.get("sym_cooldown", {}))
+        best_score_today = _state.get("best_score_today", 0)
+        best_setup_today = _state.get("best_setup_today")
         health = dict(_state["health"])
     win_rate = round(tw / tt * 100, 1) if tt else 0.0
 
@@ -1420,6 +1455,8 @@ def api_data():
         "max_trades_per_day": MAX_TRADES_PER_DAY,
         "sym_cooldown":   cooldowns,
         "cooldown_min":   COOLDOWN_MIN,
+        "best_score_today": best_score_today,
+        "best_setup_today": best_setup_today,
         "snapshot_errors": snap.errors,
         "health":         health,
         "snapshot_age_s": ((datetime.now(ET) - _snap_data["ts"]).total_seconds()
