@@ -59,6 +59,14 @@ MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 COOLDOWN_MIN       = int(os.environ.get("SYMBOL_COOLDOWN_MIN", "30"))   # min between same-symbol entries
 MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "5"))     # hard cap on round-trips/day
 
+# AI Agent integration (optional layer that runs as a separate Render service).
+# When configured, whale-bot calls the agent before placing trades. Agent can
+# VETO trades it considers risky. If agent is down or unset, bot falls back
+# to score-only logic and trades anyway. Always safe.
+AGENT_URL        = os.environ.get("AGENT_URL", "").rstrip("/")  # e.g. https://whale-agent.onrender.com
+AGENT_AUTH_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")
+AGENT_TIMEOUT_S  = float(os.environ.get("AGENT_TIMEOUT_S", "8"))
+
 LIVE_MODE = "paper" not in BASE_URL.lower()
 ET = pytz.timezone("America/New_York")
 UTC = pytz.UTC
@@ -129,8 +137,12 @@ _state = {
     # Visibility into what the bot considered today (helps debug "why no trades")
     "best_score_today": 0,
     "best_setup_today": None,
+    # Scheduled jobs fired today (was local to bot_loop, moved here so
+    # reset_if_new_day() actually clears it — otherwise day-2 scans get
+    # silently skipped because the keys carry over from day-1)
+    "triggered_today": set(),
     "tracker": {
-        "date": str(date.today()),
+        "date": datetime.now(ET).strftime("%Y-%m-%d"),
         "wins_today": 0,
         "losses_today": 0,
         "day_trades": 0,
@@ -900,6 +912,59 @@ def fetch_news():
     except Exception as e:
         log.debug(f"news: {e}")
 
+# ── AI AGENT INTEGRATION ──────────────────────────────────────────────────────
+def ask_agent(setup, swing=False):
+    """
+    Ask the agent service to evaluate this setup. Returns dict:
+      {"decision": "APPROVE"|"VETO", "confidence": 0-1, "reasoning": str, ...}
+    Always returns APPROVE if agent is unconfigured or unreachable — never blocks
+    the bot from trading just because the agent layer has a problem.
+    """
+    if not AGENT_URL:
+        return {"decision": "APPROVE", "reasoning": "agent not configured",
+                "confidence": 1.0, "skipped": True}
+
+    try:
+        with _lock:
+            lost = list(_state.get("lost_today", []))
+            equity_str = _state.get("health", {}).get("last_equity", "0")
+        try:
+            equity = float(get_account().get("equity", 0))
+        except Exception:
+            equity = 0
+
+        payload = {
+            "symbol":      setup["sym"],
+            "direction":   setup["dir"],
+            "price":       setup["price"],
+            "score":       setup["score"],
+            "tier":        setup["tier"],
+            "vol_ratio":   setup["vol"],
+            "change_pct":  setup["chg"],
+            "swing":       swing,
+            "shares":      setup["shares"],
+            "equity":      equity,
+            "dt_used":     get_dt_used(),
+            "dt_max":      MAX_DT,
+            "lost_today":  lost,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if AGENT_AUTH_TOKEN:
+            headers["X-Auth-Token"] = AGENT_AUTH_TOKEN
+
+        r = requests.post(f"{AGENT_URL}/evaluate", json=payload,
+                          headers=headers, timeout=AGENT_TIMEOUT_S)
+        if r.status_code != 200:
+            log.warning(f"Agent returned {r.status_code}: {r.text[:200]}")
+            return {"decision": "APPROVE", "reasoning": f"agent {r.status_code} — fallback",
+                    "confidence": 0.5, "agent_failed": True}
+        return r.json()
+    except Exception as e:
+        log.warning(f"Agent call failed: {e}")
+        return {"decision": "APPROVE", "reasoning": f"agent error: {e} — fallback",
+                "confidence": 0.5, "agent_failed": True}
+
 # ── ORDERS ────────────────────────────────────────────────────────────────────
 def place_order(setup, swing=False):
     side = "buy" if setup["dir"] == "LONG" else "sell"
@@ -941,9 +1006,18 @@ def is_occupied():
         return True  # safer to assume occupied on error
 
 def reset_if_new_day():
-    today = str(date.today())
+    """
+    Reset all daily state at midnight ET (NOT UTC).
+    Server runs in UTC, so we must explicitly convert. Without this, the bot
+    resets at midnight UTC (8pm ET, hours AFTER market close) and never resets
+    at the actual start of a new trading day.
+    """
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    reset_occurred = False
+    old_date = None
     with _lock:
         if _state["tracker"]["date"] != today:
+            old_date = _state["tracker"]["date"]
             _state["tracker"].update({
                 "date": today,
                 "wins_today": 0, "losses_today": 0, "day_trades": 0,
@@ -956,6 +1030,12 @@ def reset_if_new_day():
             _state["sym_cooldown"] = {}
             _state["best_score_today"] = 0
             _state["best_setup_today"] = None
+            _state["triggered_today"] = set()
+            reset_occurred = True
+    # IMPORTANT: push_alert acquires _lock so call it OUTSIDE the with-block
+    if reset_occurred:
+        push_alert(f"🌅 New trading day ({old_date} → {today}) — daily state reset", "info")
+        log.info(f"Day reset: {old_date} → {today}")
 
 def execute(setups, label=""):
     reset_if_new_day()
@@ -1057,18 +1137,56 @@ def execute(setups, label=""):
         regime_ok = True
     effective_threshold = MIN_SCORE if regime_ok else max(MIN_SCORE - 10, 40)
 
+    # Decide swing vs day before consulting agent (agent benefits from knowing this)
+    will_swing = False
+    will_trade = False
     if best["tier"] == 3:
-        ok = place_order(best, swing=pdt_maxed)
+        will_swing = pdt_maxed
+        will_trade = True
     elif pdt_maxed and best["score"] >= effective_threshold:
-        push_alert(f"🔄 Day trade limit — SWING: {best['sym']} (score {best['score']} ≥ {effective_threshold})", "warning")
-        ok = place_order(best, swing=True)
+        will_swing = True
+        will_trade = True
     elif pdt_maxed:
         push_alert(f"🛑 DT maxed + score {best['score']} below threshold {effective_threshold} — skip {best['sym']}", "warning")
         return
     elif best["score"] >= MIN_SCORE:
-        ok = place_order(best, swing=False)
+        will_swing = False
+        will_trade = True
     else:
         return
+
+    if not will_trade:
+        return
+
+    # ── AI AGENT VETO CHECK ──────────────────────────────────────────
+    # Ask the optional agent layer for a second opinion. If agent is configured
+    # and returns VETO, skip the trade. If not configured or unreachable,
+    # ask_agent() returns APPROVE so we don't block.
+    if AGENT_URL:
+        agent_resp = ask_agent(best, swing=will_swing)
+        a_decision = agent_resp.get("decision", "APPROVE")
+        a_reason   = (agent_resp.get("reasoning") or "")[:120]
+        a_conf     = agent_resp.get("confidence", 1.0)
+        a_shadow   = agent_resp.get("shadow", False)
+        a_shadow_d = agent_resp.get("shadow_decision")
+
+        if a_shadow and a_shadow_d:
+            push_alert(f"👻 Agent (shadow): would {a_shadow_d} {best['sym']} | {a_reason}", "info")
+        else:
+            emoji = "🟢" if a_decision == "APPROVE" else "🔴"
+            push_alert(f"{emoji} Agent {a_decision} {best['sym']} (conf {a_conf:.2f}) | {a_reason}", "info")
+
+        if a_decision == "VETO":
+            push_alert(f"🛑 Trade vetoed by agent: {best['sym']}", "warning")
+            return
+
+    if best["tier"] == 3:
+        ok = place_order(best, swing=will_swing)
+    elif will_swing:
+        push_alert(f"🔄 Day trade limit — SWING: {best['sym']} (score {best['score']} ≥ {effective_threshold})", "warning")
+        ok = place_order(best, swing=True)
+    else:
+        ok = place_order(best, swing=False)
 
     if ok:
         with _lock:
@@ -1257,7 +1375,10 @@ def bot_loop():
     except Exception as e:
         push_alert(f"⚠️ Startup err: {e}", "warning")
 
-    triggered = set()
+    # NOTE: triggered_today is now in _state so reset_if_new_day() can clear it.
+    # The old local `triggered = set()` was a real bug — if the bot stayed alive
+    # across midnight ET, day-2 scheduled scans got silently skipped because
+    # their keys were already in the set from day 1.
     while True:
         try:
             update_health("last_loop_at", _now_et_str())
@@ -1276,12 +1397,19 @@ def bot_loop():
                 "15:55": eod,
             }
 
+            with _lock:
+                triggered = _state["triggered_today"]
+
+            def mark(k):
+                with _lock:
+                    _state["triggered_today"].add(k)
+
             if key in schedule and key not in triggered:
                 schedule[key]()
-                triggered.add(key)
+                mark(key)
             elif 8 <= h < 16 and m in (0, 30) and f"news_{key}" not in triggered:
                 fetch_news()
-                triggered.add(f"news_{key}")
+                mark(f"news_{key}")
             elif 9 <= h < 16 and m % 10 == 0 and f"protect_{key}" not in triggered:
                 # Protection sweep every 10 minutes during session — catches
                 # any position that lost its bracket legs for any reason
@@ -1289,7 +1417,7 @@ def bot_loop():
                     protect_positions()
                 except Exception as e:
                     push_alert(f"⚠️ Protection sweep err: {e}", "warning")
-                triggered.add(f"protect_{key}")
+                mark(f"protect_{key}")
             elif 9 <= h < 16 and m % 2 == 0 and key not in triggered:
                 try:
                     monitor()
@@ -1300,11 +1428,14 @@ def bot_loop():
                             execute(whales, "WHALE ALERT")
                 except Exception as e:
                     push_alert(f"⚠️ Scan err: {e}", "warning")
-                triggered.add(key)
+                mark(key)
 
+            # Belt-and-suspenders midnight ET reset — redundant with
+            # reset_if_new_day() clearing triggered_today, but harmless
             if h == 0 and m == 1 and "midnight" not in triggered:
-                triggered.clear()
-                triggered.add("midnight")
+                with _lock:
+                    _state["triggered_today"].clear()
+                    _state["triggered_today"].add("midnight")
 
             time.sleep(20)
         except Exception as e:
@@ -1346,6 +1477,13 @@ app = Flask(__name__)
 def authed():
     tok = request.headers.get("X-Token", "") or request.args.get("token", "")
     return tok == DASH_PASS
+
+def agent_authed():
+    """Auth check for endpoints the agent calls — accepts AGENT_AUTH_TOKEN OR DASH_PASS."""
+    if authed():
+        return True
+    tok = request.headers.get("X-Auth-Token", "")
+    return bool(AGENT_AUTH_TOKEN) and tok == AGENT_AUTH_TOKEN
 
 # ── SINGLE SOURCE OF TRUTH: /api/data ────────────────────────────────────────
 @app.route("/api/data")
@@ -1551,11 +1689,144 @@ def api_estop():
 @app.route("/api/protect", methods=["POST"])
 def api_protect():
     """Manually trigger position protection check. Re-places missing SL/TP as GTC."""
-    if not authed():
+    if not agent_authed():
         return jsonify({"error": "Wrong password"}), 401
     try:
         protect_positions()
         return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── ADMIN ENDPOINTS (callable by agent monitor) ──────────────────────────────
+@app.route("/api/admin/health", methods=["GET"])
+def api_admin_health():
+    """
+    Detailed health diagnostic for the agent monitor. Returns full state in
+    one call so the agent can detect:
+      - day rollover failures (tracker.date != today_ET)
+      - bot silence (last_loop_at, last_scan_at)
+      - unprotected positions / orphan orders
+      - error rate spikes
+      - state staleness
+    """
+    if not agent_authed():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        snap = get_snapshot()
+        now_et = datetime.now(ET)
+        with _lock:
+            tracker_date = _state["tracker"]["date"]
+            triggered = list(_state.get("triggered_today", set()))
+            paused = _state.get("paused", False)
+            e_stop = _state.get("e_stop", False)
+            health = dict(_state.get("health", {}))
+            bot_dt_count = _state.get("bot_dt_count", 0)
+            completed_today = _state.get("completed_trades_today", 0)
+            best_score = _state.get("best_score_today", 0)
+            lost_today = list(_state.get("lost_today", []))
+
+        # Determine unprotected positions / orphan orders for the monitor
+        positions = snap.positions or []
+        orders    = snap.orders or []
+
+        orders_by_sym = {}
+        for o in orders:
+            s = o.get("symbol", "")
+            otype = (o.get("order_type") or o.get("type") or "").lower()
+            orders_by_sym.setdefault(s, {"stop": False, "limit": False, "ids": []})
+            orders_by_sym[s]["ids"].append(o.get("id"))
+            if "stop" in otype:  orders_by_sym[s]["stop"] = True
+            if "limit" in otype: orders_by_sym[s]["limit"] = True
+
+        position_syms = {p.get("symbol", "") for p in positions}
+        unprotected = []
+        for p in positions:
+            s = p.get("symbol", "")
+            prot = orders_by_sym.get(s, {"stop": False, "limit": False})
+            if not (prot["stop"] and prot["limit"]):
+                unprotected.append(s)
+
+        orphans = []
+        for s, info in orders_by_sym.items():
+            if s not in position_syms:
+                orphans.extend(info["ids"])
+
+        # Compute staleness
+        last_loop = health.get("last_loop_at", "")
+        last_scan = health.get("last_scan_at", "")
+        try:
+            last_loop_dt = datetime.fromisoformat(last_loop) if last_loop else None
+            loop_age_s = (now_et - last_loop_dt).total_seconds() if last_loop_dt else None
+        except Exception:
+            loop_age_s = None
+
+        return jsonify({
+            "ok":               True,
+            "now_et":           now_et.strftime("%Y-%m-%d %H:%M:%S"),
+            "today_et":         now_et.strftime("%Y-%m-%d"),
+            "tracker_date":     tracker_date,
+            "rollover_stuck":   tracker_date != now_et.strftime("%Y-%m-%d"),
+            "loop_age_s":       loop_age_s,
+            "last_loop_at":     last_loop,
+            "last_scan_at":     last_scan,
+            "errors":           health.get("alpaca_err_count", 0),
+            "calls":            health.get("alpaca_call_count", 0),
+            "paused":           paused,
+            "e_stop":           e_stop,
+            "position_count":   len(positions),
+            "order_count":      len(orders),
+            "unprotected_syms": unprotected,
+            "orphan_order_ids": orphans,
+            "triggered_count":  len(triggered),
+            "bot_dt_count":     bot_dt_count,
+            "completed_today":  completed_today,
+            "best_score_today": best_score,
+            "lost_today":       lost_today,
+            "market_open":      (snap.clock or {}).get("is_open", False),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/admin/force_reset", methods=["POST"])
+def api_admin_force_reset():
+    """Force reset_if_new_day() — clears triggered_today, lost_today, etc."""
+    if not agent_authed():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        with _lock:
+            old_date = _state["tracker"]["date"]
+            # Force the comparison to trigger reset
+            _state["tracker"]["date"] = "1970-01-01"
+        reset_if_new_day()
+        with _lock:
+            new_date = _state["tracker"]["date"]
+        push_alert(f"🔧 Admin force-reset (was '{old_date}' → now '{new_date}')", "warning")
+        return jsonify({"ok": True, "old_date": old_date, "new_date": new_date})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/admin/cancel_orphans", methods=["POST"])
+def api_admin_cancel_orphans():
+    """Cancel orders that have no matching open position (orphans)."""
+    if not agent_authed():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        positions = get_positions()
+        orders = get_orders_open()
+        position_syms = {p.get("symbol") for p in positions if p.get("symbol")}
+        cancelled = []
+        for o in orders:
+            sym = o.get("symbol", "")
+            oid = o.get("id", "")
+            if sym and sym not in position_syms and oid:
+                try:
+                    aDel(f"/v2/orders/{oid}")
+                    cancelled.append({"symbol": sym, "id": oid})
+                except Exception as e:
+                    log.warning(f"Failed to cancel orphan {oid}: {e}")
+        if cancelled:
+            push_alert(f"🧹 Cancelled {len(cancelled)} orphan order(s): {[c['symbol'] for c in cancelled]}", "warning")
+        return jsonify({"ok": True, "cancelled": cancelled})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
