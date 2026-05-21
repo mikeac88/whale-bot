@@ -46,6 +46,7 @@ PORT       = int(os.environ.get("PORT", 8080))
 KEEPALIVE  = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 TRADE_SIZE   = float(os.environ.get("TRADE_SIZE",   "25"))
+MAX_POSITION = float(os.environ.get("MAX_POSITION", "1000000"))  # safety ceiling, default = no cap
 DAILY_GOAL   = float(os.environ.get("DAILY_GOAL",   "100"))
 MAX_LOSS     = float(os.environ.get("MAX_LOSS",     "25"))
 STOP_PCT     = float(os.environ.get("STOP_PCT",     "0.05"))
@@ -807,7 +808,14 @@ def scan_one(sym, healthy, tsize):
         vr  = d.get("v", 0) / max(p.get("v", 1), 1)
         chg = (cur - pc) / pc
         tier, _ = whale_tier(snap)
-        shares = max(1, int(tsize / cur))
+        # Whole-share sizing that scales purely via TRADE_SIZE env var.
+        # int() floors, so a stock too expensive for the current TRADE_SIZE
+        # yields 0 shares and gets skipped cleanly (no forced 1-share blowups).
+        # Raising TRADE_SIZE later auto-unlocks pricier names — no code change.
+        shares = int(tsize / cur)
+        if shares < 1:
+            log.debug(f"skip {sym}: ${cur:.2f}/share too expensive for ${tsize:.0f} size")
+            return None
         sl = round(cur * (1 - STOP_PCT), 2)   if direction == "LONG" else round(cur * (1 + STOP_PCT), 2)
         tp = round(cur * (1 + TARGET_PCT), 2) if direction == "LONG" else round(cur * (1 - TARGET_PCT), 2)
         return {
@@ -838,11 +846,11 @@ def full_scan(label="SCAN"):
 
     push_alert(f"🔍 {label}: scanning {len(all_tickers)} tickers ({regime_label}, threshold {effective_score})", "info")
 
-    try:
-        cash = float(get_account().get("cash", TRADE_SIZE))
-    except Exception:
-        cash = TRADE_SIZE
-    tsize = min(max(TRADE_SIZE, cash * 0.0004), 500)
+    # Position size in dollars — scales PURELY via the TRADE_SIZE env var.
+    # Set TRADE_SIZE=25 to start; raise it (e.g. 3300) for larger capital and
+    # the $100/day goal. No code change needed — just the env var.
+    # MAX_POSITION is an optional safety ceiling (default very high = no cap).
+    tsize = min(TRADE_SIZE, MAX_POSITION)
 
     setups = []
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -1116,7 +1124,10 @@ def execute(setups, label=""):
         position_value = best["shares"] * best["price"]
         max_position = cash * (MAX_RISK_PCT * 100)
         if position_value > max_position:
-            new_shares = max(1, int(max_position / best["price"]))
+            new_shares = int(max_position / best["price"])  # floor, no forced minimum
+            if new_shares < 1:
+                push_alert(f"⚠️ {best['sym']} skipped: even 1 share (${best['price']:.0f}) exceeds risk cap (${max_position:.0f})", "warning")
+                return
             if new_shares < best["shares"]:
                 push_alert(f"⚠️ Sizing capped {best['sym']}: {best['shares']}→{new_shares}", "warning")
                 best["shares"] = new_shares
@@ -1459,7 +1470,14 @@ def keepalive_loop():
 
 def snapshot_loop():
     """Refresh dashboard snapshot every 4s in background — keeps mobile fast.
-    The cache TTL in get_snapshot() matches this interval to avoid double-fetching."""
+    The cache TTL in get_snapshot() matches this interval to avoid double-fetching.
+
+    CRITICAL: also updates anti-overtrade state (lost_today, cooldowns, bot
+    day-trade count) here — NOT just in api_data(). Previously this only ran
+    when the dashboard was polled over HTTP, so if no browser was open the bot's
+    scan loop read stale lost_today and could re-enter a same-day loser (this
+    caused the May 18 HCAI re-entry: -$1.66). Now it refreshes every 4s no
+    matter what, so the scan loop always sees fresh state."""
     time.sleep(2)
     while True:
         try:
@@ -1467,6 +1485,11 @@ def snapshot_loop():
             with _snap_lock:
                 _snap_data["snap"] = snap
                 _snap_data["ts"] = datetime.now(ET)
+            # Keep anti-overtrade state fresh independent of HTTP traffic
+            try:
+                update_closed_trade_state(snap.fills or [], snap.lookback_fills or [])
+            except Exception as e:
+                log.debug(f"snap loop state update: {e}")
         except Exception as e:
             log.debug(f"snap loop: {e}")
         time.sleep(4)
