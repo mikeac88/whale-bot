@@ -53,12 +53,62 @@ STOP_PCT     = float(os.environ.get("STOP_PCT",     "0.05"))
 TARGET_PCT   = float(os.environ.get("TARGET_PCT",   "0.07"))
 MIN_SCORE    = int(os.environ.get("MIN_SCORE",      "55"))
 MIN_PRICE    = float(os.environ.get("MIN_PRICE",    "10.0"))
+# Bear/inverse ETFs trade far cheaper (SOXS ~$5, UVXY/VXX often <$10) yet are
+# core to the down-day playbook. Give them a lower floor so the $10 MIN_PRICE
+# doesn't silently exclude them — surfaced by the June 2 replay (SOXS was on the
+# watchlist but filtered out on price).
+BEAR_MIN_PRICE = float(os.environ.get("BEAR_MIN_PRICE", "3.0"))
 MAX_DT       = int(os.environ.get("MAX_DAY_TRADES", "2"))
 MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 
 # Anti-overtrade controls (added after live-day churning incident May 4 2026)
 COOLDOWN_MIN       = int(os.environ.get("SYMBOL_COOLDOWN_MIN", "30"))   # min between same-symbol entries
 MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "5"))     # hard cap on round-trips/day
+
+# ── DYNAMIC DISCOVERY / GAP-AND-GO / VWAP / ORB ───────────────────────────────
+# All three are additive: discovery only widens the scan universe, the gap and
+# ORB layers only ADD score, and the VWAP filter is the one hard gate (and can
+# be disabled). Every piece degrades gracefully — if Alpaca returns nothing the
+# bot falls straight back to its static-watchlist, score-only behaviour.
+
+# (1) Dynamic ticker discovery from Alpaca movers screener
+MOVERS_ENABLED = os.environ.get("MOVERS_ENABLED", "true").lower() == "true"
+MOVERS_COUNT   = int(os.environ.get("MOVERS_COUNT",   "15"))   # top N gainers AND losers
+MOVERS_MIN_CHG = float(os.environ.get("MOVERS_MIN_CHG", "3.0")) # min abs % move to include
+
+# (2) Premarket gap-and-go scanner
+# DEFAULT OFF: the June 2 replay showed IEX premarket is too thin for the
+# explosive names this is meant to catch (movers had 0 premarket bars on IEX).
+# Leave off until the data feed is upgraded to SIP, then set GAP_ENABLED=true.
+GAP_ENABLED   = os.environ.get("GAP_ENABLED", "false").lower() == "true"
+GAP_MIN_PCT   = float(os.environ.get("GAP_MIN_PCT",   "0.04"))   # 4% gap off prior close
+GAP_MIN_PMVOL = int(os.environ.get("GAP_MIN_PMVOL", "50000"))    # min cumulative premarket vol
+GAP_BOOST     = int(os.environ.get("GAP_BOOST",        "12"))    # score boost on confirmed "go"
+
+# Guardrails for DYNAMICALLY DISCOVERED names (movers/news, not the curated
+# watchlist). Added after the June 2 replay: the bot shorted a dead-cat bounce
+# in ABVX (down 44% intraday) and got stopped out. Curated watchlist names are
+# exempt; only names the bot pulled in dynamically get this stricter gate.
+DISCOVERED_MAX_CHG  = float(os.environ.get("DISCOVERED_MAX_CHG",  "0.25"))    # reject if already moved >25% off prior close
+DISCOVERED_MIN_DVOL = float(os.environ.get("DISCOVERED_MIN_DVOL", "5000000")) # min cumulative $ volume (liquidity floor)
+
+# (4) NEWS LAST-LAYER — final catalyst confirmation, runs right before execution.
+# Reuses the same Alpaca news feed as discovery, but per-symbol: confirms a
+# setup has a FRESH catalyst behind it (matches the "fresh catalyst only" rule).
+# Default behaviour is additive (boost only); flip NEWS_REQUIRED on to make a
+# fresh catalyst mandatory. Fails OPEN so a news outage can never freeze trading.
+NEWS_LAYER_ENABLED = os.environ.get("NEWS_LAYER_ENABLED", "true").lower() == "true"
+NEWS_REQUIRED      = os.environ.get("NEWS_REQUIRED", "false").lower() == "true"   # hard gate (off by default)
+NEWS_BOOST         = int(os.environ.get("NEWS_BOOST",        "10"))               # score boost when fresh news exists
+NEWS_MAX_AGE_HRS   = float(os.environ.get("NEWS_MAX_AGE_HRS", "24"))              # how recent counts as "fresh"
+NEWS_CACHE_MIN     = int(os.environ.get("NEWS_CACHE_MIN",     "10"))              # per-symbol cache TTL (minutes)
+
+# (3) VWAP filter + Opening Range Breakout boost
+VWAP_FILTER   = os.environ.get("VWAP_FILTER", "true").lower() == "true"
+VWAP_MIN_BARS = int(os.environ.get("VWAP_MIN_BARS",     "5"))    # don't gate on < N session bars
+ORB_ENABLED   = os.environ.get("ORB_ENABLED", "true").lower() == "true"
+ORB_MINUTES   = int(os.environ.get("ORB_MINUTES",      "15"))    # opening-range length (minutes)
+ORB_BOOST     = int(os.environ.get("ORB_BOOST",        "12"))    # score boost on OR breakout
 
 # AI Agent integration (optional layer that runs as a separate Render service).
 # When configured, whale-bot calls the agent before placing trades. Agent can
@@ -129,6 +179,8 @@ _state = {
     "e_stop": False,
     "alerts": [],
     "news_tickers": [],
+    "mover_tickers": [],          # dynamic discovery from Alpaca movers screener
+    "gap_candidates": {},         # sym -> {gap, pm_vol, pm_high, price} from premarket scan
     "traded_today": [],
     "lost_today": [],
     # Anti-overtrade tracking — populated by update_closed_trade_state()
@@ -706,6 +758,52 @@ def calc_ema(bars, p=9):
         e = x * k + e * (1 - k)
     return round(e, 2)
 
+# ── SESSION-ANCHORED BARS (for VWAP + ORB) ────────────────────────────────────
+def _et_today_at(hour, minute):
+    """Today's HH:MM in ET as an aware datetime."""
+    return datetime.now(ET).replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+def _iso_utc(dt):
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def get_scan_minute_bars(sym, timeout=8):
+    """1-minute bars for VWAP + ORB.
+
+    Anchored to today's regular-session open (9:30 ET) so VWAP is a true
+    intraday session VWAP rather than a rolling 60-minute average. Before the
+    open we just grab the most recent 60 bars so premarket scans still have
+    something to work with (VWAP filter / ORB simply won't trigger yet)."""
+    now = datetime.now(ET)
+    open_et = _et_today_at(9, 30)
+    params = {"timeframe": "1Min", "feed": "iex"}
+    if now >= open_et:
+        params["start"] = _iso_utc(open_et)
+        params["limit"] = 500
+    else:
+        params["limit"] = 60
+    return aGet(f"/v2/stocks/{sym}/bars", params, DATA_URL, timeout=timeout).get("bars", [])
+
+def calc_opening_range(bars, minutes=ORB_MINUTES):
+    """High/low of the first `minutes` of the regular session.
+
+    Returns (or_high, or_low, complete). `complete` is False until the opening
+    range window has fully elapsed, so a breakout can't be called prematurely."""
+    if not bars:
+        return None, None, False
+    open_et = _et_today_at(9, 30)
+    or_end = open_et + timedelta(minutes=minutes)
+    hi = lo = None
+    for b in bars:
+        try:
+            bt = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+        except Exception:
+            continue
+        if open_et <= bt < or_end:
+            hi = b["h"] if hi is None else max(hi, b["h"])
+            lo = b["l"] if lo is None else min(lo, b["l"])
+    complete = datetime.now(ET) >= or_end
+    return hi, lo, complete
+
 # ── MARKET REGIME ─────────────────────────────────────────────────────────────
 _regime = {"ts": None, "ok": True, "chg": 0.0}
 
@@ -779,6 +877,41 @@ def score_ticker(sym, snap, dbars, mbars, healthy=True):
             score += 15 if dist > 0.01 else 8 if dist > -0.005 else 0
         else:
             score += 15 if dist < -0.01 else 8 if dist < 0.005 else 0
+        # Hard VWAP filter: a long must be trading ABOVE session VWAP, a short
+        # BELOW it. Skipped until enough session bars exist, because VWAP is
+        # pure noise in the first minutes after the open and would reject
+        # everything. Disable entirely with VWAP_FILTER=false.
+        if VWAP_FILTER and len(mbars) >= VWAP_MIN_BARS:
+            if direction == "LONG" and cur < v:
+                return 0, direction
+            if direction == "SHORT" and cur > v:
+                return 0, direction
+
+    # ── ORB: opening-range breakout boost ─────────────────────────────────────
+    # Reward names that clear the first ORB_MINUTES high (long) or low (short).
+    # Only counts once the opening range has fully formed.
+    if ORB_ENABLED and mbars:
+        or_hi, or_lo, complete = calc_opening_range(mbars, ORB_MINUTES)
+        if complete and or_hi and or_lo:
+            if direction == "LONG" and cur > or_hi:
+                score += ORB_BOOST
+            elif direction == "SHORT" and cur < or_lo:
+                score += ORB_BOOST
+
+    # ── Gap-and-go confirmation boost ─────────────────────────────────────────
+    # If premarket flagged this as a gapper, the "go" is price clearing the
+    # premarket high on an up-gap (the classic continuation trigger). Down-gap
+    # names get the boost on the short side.
+    if GAP_ENABLED:
+        with _lock:
+            gc = _state.get("gap_candidates", {}).get(sym)
+        if gc:
+            pm_high = gc.get("pm_high")
+            gap = gc.get("gap", 0)
+            if direction == "LONG" and gap > 0 and pm_high and cur > pm_high:
+                score += GAP_BOOST
+            elif direction == "SHORT" and gap < 0:
+                score += GAP_BOOST
 
     if sym in TIER1: score = min(100, score + 5)
     if not healthy:  score = int(score * 0.8)
@@ -794,17 +927,35 @@ def scan_one(sym, healthy, tsize):
         t = snap.get("latestTrade", {})
         cur = t.get("p", d.get("c", 0))
         pc  = p.get("c", 0)
-        if cur < MIN_PRICE or not pc:
+        price_floor = BEAR_MIN_PRICE if sym in BEAR_TICKERS else MIN_PRICE
+        if cur < price_floor or not pc:
             return None
+        # Discovered-name guardrails. Curated watchlist names skip this; only
+        # dynamically pulled-in names (movers/news/gappers) face the stricter
+        # gate, so the bot doesn't chase blow-off moves or illiquid traps.
+        if sym not in TICKERS:
+            chg0 = (cur - pc) / pc
+            if abs(chg0) > DISCOVERED_MAX_CHG:
+                log.debug(f"skip {sym}: discovered move {chg0:+.0%} > cap {DISCOVERED_MAX_CHG:.0%}")
+                return None
+            if d.get("v", 0) * cur < DISCOVERED_MIN_DVOL:
+                log.debug(f"skip {sym}: discovered $vol ${d.get('v',0)*cur:,.0f} < floor")
+                return None
         dbars = aGet(f"/v2/stocks/{sym}/bars",
                      {"timeframe": "1Day", "limit": 20, "feed": "iex"},
                      DATA_URL, timeout=8).get("bars", [])
-        mbars = aGet(f"/v2/stocks/{sym}/bars",
-                     {"timeframe": "1Min", "limit": 60, "feed": "iex"},
-                     DATA_URL, timeout=8).get("bars", [])
+        mbars = get_scan_minute_bars(sym, timeout=8)
         sc, direction = score_ticker(sym, snap, dbars, mbars, healthy)
         if sc < MIN_SCORE:
             return None
+        # ── NEWS LAST-LAYER: confirm a fresh catalyst before committing ──
+        # Runs after every other layer — the final check before a setup is real.
+        news = news_confirmation(sym)
+        if NEWS_REQUIRED and not news["fresh"]:
+            log.debug(f"skip {sym}: no fresh catalyst (news layer)")
+            return None
+        if news["fresh"]:
+            sc = min(100, sc + NEWS_BOOST)
         vr  = d.get("v", 0) / max(p.get("v", 1), 1)
         chg = (cur - pc) / pc
         tier, _ = whale_tier(snap)
@@ -829,6 +980,8 @@ def scan_one(sym, healthy, tsize):
             "shares": shares,
             "sl":     sl,
             "tp":     tp,
+            "news":   news["count"],
+            "news_age_min": news["age_min"],
         }
     except Exception as e:
         log.debug(f"scan {sym}: {e}")
@@ -838,7 +991,9 @@ def full_scan(label="SCAN"):
     update_health("last_scan_at", _now_et_str())
     with _lock:
         news = list(_state["news_tickers"])
-    all_tickers = sorted(set(TICKERS + news))
+        movers = list(_state.get("mover_tickers", []))
+        gappers = list(_state.get("gap_candidates", {}).keys())
+    all_tickers = sorted(set(TICKERS + news + movers + gappers))
 
     ok, _ = market_regime()
     regime_label = "✅ BULL" if ok else "⚠️ BEAR"
@@ -919,6 +1074,143 @@ def fetch_news():
                 _state["news_tickers"] = hot
     except Exception as e:
         log.debug(f"news: {e}")
+
+# ── NEWS LAST-LAYER: per-symbol catalyst confirmation ─────────────────────────
+_news_cache = {}   # sym -> (epoch_fetched, result_dict)
+
+def news_confirmation(sym):
+    """Final pre-trade layer: is there a FRESH catalyst behind this setup?
+
+    Queries the same Alpaca news endpoint used by fetch_news(), but scoped to
+    one symbol over the NEWS_MAX_AGE_HRS window. Returns recency/coverage so the
+    caller can boost (or, if NEWS_REQUIRED, require) a catalyst. Cached per
+    symbol so the continuous 2-minute scans don't hammer the endpoint. Fails
+    OPEN (fresh=False, never blocks on its own) on any error, so a news outage
+    only removes the boost — it can never freeze the bot."""
+    if not NEWS_LAYER_ENABLED:
+        return {"fresh": False, "count": 0, "age_min": None, "headline": None}
+    now = time.time()
+    with _lock:
+        cached = _news_cache.get(sym)
+    if cached and now - cached[0] < NEWS_CACHE_MIN * 60:
+        return cached[1]
+    res = {"fresh": False, "count": 0, "age_min": None, "headline": None}
+    try:
+        since = (datetime.now(ET) - timedelta(hours=NEWS_MAX_AGE_HRS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data = aGet("/v1beta1/news",
+                    params={"symbols": sym, "start": since, "limit": 10, "sort": "desc"},
+                    base=DATA_URL, timeout=6)
+        arts = data.get("news", [])
+        if arts:
+            latest = arts[0]
+            ts = latest.get("updated_at") or latest.get("created_at")
+            age = None
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    age = (datetime.now(UTC) - dt).total_seconds() / 60.0
+                except Exception:
+                    age = None
+            res = {"fresh": True, "count": len(arts),
+                   "age_min": round(age, 1) if age is not None else None,
+                   "headline": (latest.get("headline") or "")[:120]}
+    except Exception as e:
+        log.debug(f"news_confirmation {sym}: {e}")
+    with _lock:
+        _news_cache[sym] = (now, res)
+    return res
+
+# ── DYNAMIC DISCOVERY: ALPACA MOVERS ──────────────────────────────────────────
+def fetch_movers():
+    """Widen the scan universe with the day's biggest movers.
+
+    Pulls Alpaca's stocks movers screener (top gainers + losers) and adds any
+    name not already on the static watchlist that's moving at least
+    MOVERS_MIN_CHG percent. Mirrors fetch_news(): discovery only — direction
+    and conviction are still decided entirely by score_ticker(). Degrades
+    silently if the screener is unavailable on the data plan."""
+    if not MOVERS_ENABLED:
+        return
+    try:
+        data = aGet("/v1beta1/screener/stocks/movers",
+                    params={"top": max(MOVERS_COUNT, 10)}, base=DATA_URL)
+        found = []
+        for side in ("gainers", "losers"):
+            for m in data.get(side, [])[:MOVERS_COUNT]:
+                sym = (m.get("symbol") or "").upper()
+                pct = abs(float(m.get("percent_change", 0) or 0))
+                if (sym and len(sym) <= 5 and sym.isalpha()
+                        and pct >= MOVERS_MIN_CHG and sym not in TICKERS):
+                    found.append(sym)
+        found = sorted(set(found))
+        if found:
+            shown = ", ".join(found[:12])
+            extra = f" +{len(found) - 12} more" if len(found) > 12 else ""
+            push_alert(f"📈 Movers: {shown}{extra}", "info")
+            with _lock:
+                _state["mover_tickers"] = found
+    except Exception as e:
+        log.debug(f"movers: {e}")
+
+# ── PREMARKET GAP-AND-GO SCANNER ──────────────────────────────────────────────
+def premarket_scan():
+    """Build the gap-and-go watchlist before the open.
+
+    Finds names gapping at least GAP_MIN_PCT off the prior close on real
+    premarket volume (>= GAP_MIN_PMVOL), and records each one's premarket high.
+    The opening scans then confirm the "go" — price clearing that premarket
+    high — before score_ticker() awards the gap boost. Alerts only here; no
+    orders are placed premarket (the bracket logic needs a live session)."""
+    if not GAP_ENABLED:
+        return
+    # Refresh movers first so the gap universe sees today's hot names too.
+    fetch_movers()
+    with _lock:
+        extra = list(_state.get("mover_tickers", [])) + list(_state.get("news_tickers", []))
+    universe = sorted(set(TICKERS + extra))
+    pm_start = _iso_utc(_et_today_at(4, 0))   # premarket session opens 4:00 ET
+
+    def _check(sym):
+        try:
+            snap = aGet(f"/v2/stocks/{sym}/snapshot", base=DATA_URL, timeout=8)
+            pc  = snap.get("prevDailyBar", {}).get("c", 0)
+            cur = snap.get("latestTrade", {}).get("p", 0)
+            if not pc or cur < (BEAR_MIN_PRICE if sym in BEAR_TICKERS else MIN_PRICE):
+                return None
+            gap = (cur - pc) / pc
+            if abs(gap) < GAP_MIN_PCT:
+                return None
+            pmbars = aGet(f"/v2/stocks/{sym}/bars",
+                          {"timeframe": "1Min", "start": pm_start, "limit": 400, "feed": "iex"},
+                          DATA_URL, timeout=8).get("bars", [])
+            pm_vol = sum(b["v"] for b in pmbars)
+            if pm_vol < GAP_MIN_PMVOL:
+                return None
+            pm_high = max((b["h"] for b in pmbars), default=cur)
+            return sym, {"gap": round(gap * 100, 2), "pm_vol": int(pm_vol),
+                         "pm_high": round(pm_high, 2), "price": round(cur, 2)}
+        except Exception as e:
+            log.debug(f"premarket {sym}: {e}")
+            return None
+
+    candidates = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for r in ex.map(_check, universe):
+            if r:
+                candidates[r[0]] = r[1]
+
+    with _lock:
+        _state["gap_candidates"] = candidates
+
+    if candidates:
+        top = sorted(candidates.items(), key=lambda kv: abs(kv[1]["gap"]), reverse=True)[:8]
+        lines = ["🌅 Gap-and-go watch:"]
+        for sym, c in top:
+            arrow = "⬆️" if c["gap"] > 0 else "⬇️"
+            lines.append(f"  {arrow} {sym} {c['gap']:+.1f}% pmVol:{c['pm_vol']:,} pmHigh:${c['pm_high']}")
+        push_alert("\n".join(lines), "success")
+    else:
+        push_alert("🌅 Premarket scan — no qualifying gappers", "info")
 
 # ── AI AGENT INTEGRATION ──────────────────────────────────────────────────────
 def ask_agent(setup, swing=False):
@@ -1033,6 +1325,8 @@ def reset_if_new_day():
             _state["traded_today"] = []
             _state["lost_today"]   = []
             _state["news_tickers"] = []
+            _state["mover_tickers"] = []
+            _state["gap_candidates"] = {}
             _state["bot_dt_count"] = 0
             _state["completed_trades_today"] = 0
             _state["sym_cooldown"] = {}
@@ -1399,7 +1693,9 @@ def bot_loop():
             key = f"{h}:{m:02d}"
 
             schedule = {
-                "8:00":  lambda: job("PREMARKET 8AM"),
+                "7:30":  premarket_scan,
+                "8:00":  lambda: (premarket_scan(), job("PREMARKET 8AM")),
+                "9:15":  premarket_scan,
                 "9:30":  lambda: (protect_positions(), job("OPENING RANGE")),  # protect first
                 "9:45":  lambda: job("ORB BREAKOUT"),
                 "10:00": lambda: job("MOMENTUM 10AM"),
@@ -1420,6 +1716,7 @@ def bot_loop():
                 mark(key)
             elif 8 <= h < 16 and m in (0, 30) and f"news_{key}" not in triggered:
                 fetch_news()
+                fetch_movers()
                 mark(f"news_{key}")
             elif 9 <= h < 16 and m % 10 == 0 and f"protect_{key}" not in triggered:
                 # Protection sweep every 10 minutes during session — catches
@@ -1642,11 +1939,20 @@ def api_debug():
         snap = get_snapshot()
         with _lock:
             health = dict(_state["health"])
+            movers = list(_state.get("mover_tickers", []))
+            gaps = dict(_state.get("gap_candidates", {}))
         return jsonify({
             "live_mode": LIVE_MODE,
             "base_url": BASE_URL,
             "tickers_count": len(TICKERS),
             "alpaca_health": health,
+            "discovery": {
+                "movers_enabled": MOVERS_ENABLED,
+                "movers_count": len(movers),
+                "movers": movers,
+                "gap_enabled": GAP_ENABLED,
+                "gap_candidates": gaps,
+            },
             "snapshot_errors": snap.errors,
             "snapshot_age_s": ((datetime.now(ET) - _snap_data["ts"]).total_seconds()
                               if _snap_data["ts"] else None),
@@ -1659,9 +1965,22 @@ def api_debug():
                 "TRADE_SIZE": TRADE_SIZE,
                 "MIN_SCORE": MIN_SCORE,
                 "MIN_PRICE": MIN_PRICE,
+                "BEAR_MIN_PRICE": BEAR_MIN_PRICE,
                 "MAX_DT": MAX_DT,
                 "STOP_PCT": STOP_PCT,
                 "TARGET_PCT": TARGET_PCT,
+                "VWAP_FILTER": VWAP_FILTER,
+                "ORB_ENABLED": ORB_ENABLED,
+                "ORB_MINUTES": ORB_MINUTES,
+                "GAP_ENABLED": GAP_ENABLED,
+                "GAP_MIN_PCT": GAP_MIN_PCT,
+                "MOVERS_MIN_CHG": MOVERS_MIN_CHG,
+                "DISCOVERED_MAX_CHG": DISCOVERED_MAX_CHG,
+                "DISCOVERED_MIN_DVOL": DISCOVERED_MIN_DVOL,
+                "NEWS_LAYER_ENABLED": NEWS_LAYER_ENABLED,
+                "NEWS_REQUIRED": NEWS_REQUIRED,
+                "NEWS_BOOST": NEWS_BOOST,
+                "NEWS_MAX_AGE_HRS": NEWS_MAX_AGE_HRS,
             }
         })
     except Exception as e:
@@ -2067,352 +2386,4 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
       <div class="btns">
         <button class="btn bp" id="btn-pause"  onclick="ctrl('pause')">⏸  PAUSE BOT</button>
         <button class="btn br" id="btn-resume" onclick="ctrl('resume')" disabled>▶  RESUME BOT</button>
-        <button class="btn bs" onclick="showModal()">🛑  EMERGENCY STOP</button>
-      </div>
-      <div class="note">
-        <b style="color:var(--text)">PAUSE</b> stops new trades, holds positions<br>
-        <b style="color:var(--text)">EMERGENCY STOP</b> cancels orders + closes positions
-      </div>
-    </div>
-  </div>
-
-  <div class="g21">
-    <div class="card">
-      <div class="ct">Live Bot Activity</div>
-      <div class="logbox" id="logbox">
-        <div class="li info"><span class="lt">--:--</span><span class="lm">Connecting…</span></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="ct">Today's Trades</div>
-      <div id="trades-panel"><div class="empty">No trades today</div></div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-bottom:12px">
-    <div class="ct">Open Orders</div>
-    <table>
-      <thead><tr><th>Sym</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th></tr></thead>
-      <tbody id="ord-tb"><tr><td colspan="5" class="empty">No open orders</td></tr></tbody>
-    </table>
-  </div>
-</div>
-
-<div class="modal" id="modal">
-  <div class="mbox">
-    <h3>🛑 Emergency Stop?</h3>
-    <p>This cancels ALL orders and closes ALL positions instantly.</p>
-    <div class="mbtns">
-      <button class="btn" style="flex:1;background:rgba(255,255,255,.04);color:var(--dim);border-color:var(--bdr)" onclick="closeModal()">CANCEL</button>
-      <button class="btn bs" style="flex:1" onclick="doStop()">CONFIRM STOP</button>
-    </div>
-  </div>
-</div>
-
-<script>
-// ── helpers ────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const pw = () => $('pw').value.trim();
-const fmt = n => { const v = parseFloat(n||0); return (v>=0?'+':'') + '$' + Math.abs(v).toFixed(2); };
-const fv = n => '$' + parseFloat(n||0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
-const pc = v => parseFloat(v||0) >= 0 ? 'g' : 'r';
-
-async function api(url, method='GET', body=null) {
-  try {
-    const r = await fetch(url, {
-      method,
-      headers: {'Content-Type':'application/json', 'X-Token': pw()},
-      body: body ? JSON.stringify(body) : null
-    });
-    return await r.json();
-  } catch(e) {
-    console.error('api err', url, e);
-    return null;
-  }
-}
-
-// ── clock ──────────────────────────────────────────────────────
-function tickClock() {
-  try {
-    const t = new Intl.DateTimeFormat('en-US', {
-      timeZone:'America/New_York', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
-    }).format(new Date());
-    $('clk').textContent = t + ' ET';
-  } catch(e) {}
-}
-setInterval(tickClock, 1000); tickClock();
-
-// ── modal ──────────────────────────────────────────────────────
-function showModal() { $('modal').classList.add('show'); }
-function closeModal() { $('modal').classList.remove('show'); }
-
-// ── controls ───────────────────────────────────────────────────
-async function ctrl(action) {
-  if (!pw()) { alert('Enter dashboard password first'); return; }
-  const r = await api('/api/' + action, 'POST');
-  if (!r || r.error) { alert('Error: ' + (r && r.error || 'request failed')); return; }
-  setTimeout(loadData, 500);
-}
-async function doStop() {
-  closeModal();
-  if (!pw()) { alert('Enter password first'); return; }
-  const r = await api('/api/estop', 'POST');
-  if (!r || r.error) { alert('Error: ' + (r && r.error || 'request failed')); return; }
-  setTimeout(loadData, 500);
-}
-async function closePos(sym) {
-  if (!confirm('Close position: ' + sym + '?')) return;
-  if (!pw()) { alert('Enter password first'); return; }
-  await api('/api/close/' + sym, 'POST');
-  setTimeout(loadData, 500);
-}
-
-// ── render data ────────────────────────────────────────────────
-function renderData(d) {
-  if (!d || !d.ok) {
-    console.warn('bad data', d);
-    return;
-  }
-
-  // Mode badge
-  const mode = $('mode');
-  if (d.live_mode) {
-    mode.textContent = '🔴 LIVE';
-    mode.className = 'mode live';
-  } else {
-    mode.textContent = '📝 PAPER';
-    mode.className = 'mode paper';
-  }
-
-  // Health bar
-  const h = d.health || {};
-  $('h-ok').textContent   = h.last_alpaca_ok || '—';
-  $('h-scan').textContent = h.last_scan_at || '—';
-  $('h-calls').textContent = h.alpaca_call_count || 0;
-  const errs = h.alpaca_err_count || 0;
-  const errEl = $('h-errs');
-  errEl.textContent = errs;
-  errEl.className = errs > 5 ? 'err' : 'ok';
-  $('h-snap').textContent = (d.snapshot_age_s != null) ? d.snapshot_age_s.toFixed(1) + 's ago' : '—';
-
-  // Portfolio
-  $('equity').textContent = fv(d.equity);
-  const pv = parseFloat(d.pnl || 0);
-  $('pnl-sub').innerHTML = 'Today: <span class="' + pc(pv) + '">' + fmt(pv) + '</span>';
-
-  // P&L
-  const dpv = parseFloat(d.daily_pnl || 0);
-  const dpEl = $('dpnl');
-  dpEl.textContent = fmt(dpv);
-  dpEl.className = 'sv ' + (dpv >= 0 ? 'g' : 'r');
-  const gp = Math.min(100, Math.max(0, dpv / (d.goal || 100) * 100));
-  $('gfill').style.width = gp + '%';
-  $('goal-lbl').textContent = '$' + (d.goal || 100) + ' goal';
-
-  // P&L Periods (Daily / Weekly / Monthly / Yearly)
-  const pp = d.period_pnl || {};
-  const renderPeriod = (idVal, idPct, val, pct) => {
-    const valEl = $(idVal);
-    const pctEl = $(idPct);
-    if (val === undefined || val === null) {
-      valEl.textContent = '—';
-      pctEl.textContent = '—';
-      valEl.className = 'pval';
-      pctEl.className = 'ppct';
-      return;
-    }
-    const v = parseFloat(val) || 0;
-    const p = parseFloat(pct) || 0;
-    valEl.textContent = (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2);
-    pctEl.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
-    const cls = v >= 0 ? 'g' : 'r';
-    valEl.className = 'pval ' + cls;
-    pctEl.className = 'ppct ' + cls;
-  };
-  renderPeriod('pp-day',   'pp-day-pct',   pp.daily,   pp.daily_pct);
-  renderPeriod('pp-week',  'pp-week-pct',  pp.weekly,  pp.weekly_pct);
-  renderPeriod('pp-month', 'pp-month-pct', pp.monthly, pp.monthly_pct);
-  renderPeriod('pp-year',  'pp-year-pct',  pp.yearly,  pp.yearly_pct);
-
-  // W/L
-  $('wl').textContent = (d.wins || 0) + 'W / ' + (d.losses || 0) + 'L';
-  $('wr-sub').textContent = 'All-time win rate: ' + (d.win_rate || 0) + '%';
-
-  // Day trades
-  const dtEl = $('dt');
-  const dtSub = $('dt-sub');
-  dtEl.textContent = (d.dt_used || 0) + ' / ' + (d.dt_max || 2);
-  dtEl.className = 'sv ' + ((d.dt_used || 0) >= (d.dt_max || 2) ? 'r' : 'g');
-  if (d.pdt_flagged) {
-    dtSub.textContent = '⚠️ PDT FLAGGED — swing only at limit';
-    dtSub.style.color = 'var(--yellow)';
-  } else if ((d.dt_used || 0) >= (d.dt_max || 2)) {
-    dtSub.textContent = 'Limit reached — swing only';
-    dtSub.style.color = 'var(--yellow)';
-  } else {
-    dtSub.textContent = 'Max ' + (d.dt_max || 2) + ' day trades';
-    dtSub.style.color = '';
-  }
-
-  // Market
-  const mb = $('mbadge');
-  if (d.market_open) {
-    mb.className = 'mbadge open';
-    mb.textContent = 'MARKET OPEN';
-  } else {
-    mb.className = 'mbadge closed';
-    let txt = 'MARKET CLOSED';
-    if (d.next_open) {
-      try {
-        const no = new Date(d.next_open).toLocaleString('en-US',
-          {timeZone:'America/New_York', weekday:'short', hour:'2-digit', minute:'2-digit'});
-        txt = 'Opens ' + no;
-      } catch(e) {}
-    }
-    mb.textContent = txt;
-  }
-
-  // Bot status
-  const dot = $('sdot');
-  const st = $('stxt');
-  const bp = $('btn-pause');
-  const br = $('btn-resume');
-  if (d.e_stop) {
-    dot.className = 'dot stp'; st.className = 'stxt r'; st.textContent = 'EMERGENCY STOP';
-    bp.disabled = true; br.disabled = false;
-  } else if (d.paused) {
-    dot.className = 'dot psd'; st.className = 'stxt w'; st.textContent = 'PAUSED';
-    bp.disabled = true; br.disabled = false;
-  } else {
-    dot.className = 'dot run'; st.className = 'stxt g'; st.textContent = 'RUNNING';
-    bp.disabled = false; br.disabled = true;
-  }
-
-  // Positions
-  const pt = $('pos-tb');
-  const positions = d.positions || [];
-  if (positions.length === 0) {
-    pt.innerHTML = '<tr><td colspan="7" class="empty">No open positions</td></tr>';
-  } else {
-    pt.innerHTML = positions.map(p => {
-      const ent = parseFloat(p.avg_entry_price || 0).toFixed(2);
-      const cur = parseFloat(p.current_price || 0).toFixed(2);
-      const upl = parseFloat(p.unrealized_pl || 0);
-      const upc = parseFloat(p.unrealized_plpc || 0) * 100;
-      return '<tr>' +
-        '<td><b>' + (p.symbol || '') + '</b></td>' +
-        '<td class="' + (p.side === 'long' ? 'g' : 'r') + '">' + (p.side || '').toUpperCase() + '</td>' +
-        '<td>' + (p.qty || '') + '</td>' +
-        '<td>$' + ent + '</td>' +
-        '<td>$' + cur + '</td>' +
-        '<td class="' + pc(upl) + '">' + fmt(upl) + ' (' + upc.toFixed(1) + '%)</td>' +
-        '<td><button class="cbtn" onclick="closePos(\'' + p.symbol + '\')">CLOSE</button></td>' +
-        '</tr>';
-    }).join('');
-  }
-
-  // Orders
-  const ot = $('ord-tb');
-  const orders = d.orders || [];
-  if (orders.length === 0) {
-    ot.innerHTML = '<tr><td colspan="5" class="empty">No open orders</td></tr>';
-  } else {
-    ot.innerHTML = orders.map(o =>
-      '<tr>' +
-      '<td><b>' + (o.symbol || '') + '</b></td>' +
-      '<td class="' + (o.side === 'buy' ? 'g' : 'r') + '">' + (o.side || '').toUpperCase() + '</td>' +
-      '<td>' + (o.qty || '') + '</td>' +
-      '<td>' + (o.type || '').toUpperCase() + '</td>' +
-      '<td>' + (o.status || '') + '</td>' +
-      '</tr>'
-    ).join('');
-  }
-
-  // Trades
-  const tp = $('trades-panel');
-  const trades = d.trades || [];
-  if (trades.length === 0) {
-    tp.innerHTML = '<div class="empty">No trades today</div>';
-  } else {
-    tp.innerHTML = trades.map(t => {
-      const cls = t.side === 'buy' ? 'b' : 's';
-      const tm = (t.time || '').slice(11, 19);
-      return '<div class="trade-row">' +
-        '<span><span class="bn ' + cls + '">' + (t.side || '').toUpperCase() + '</span> <b>' + t.sym + '</b></span>' +
-        '<span>' + t.qty + ' @ $' + parseFloat(t.price || 0).toFixed(2) + '</span>' +
-        '<span style="color:var(--dim);font-size:10px">' + tm + '</span>' +
-      '</div>';
-    }).join('');
-  }
-}
-
-async function loadData() {
-  const d = await api('/api/data');
-  renderData(d);
-}
-
-async function loadLogs() {
-  const r = await api('/api/logs');
-  if (!r || !r.lines) return;
-  const box = $('logbox');
-  box.innerHTML = r.lines.slice().reverse().map(line => {
-    let cls = 'info';
-    if (/WIN|profit|✅/.test(line)) cls = 'success';
-    else if (/LOSS|failed|❌/.test(line)) cls = 'error';
-    else if (/⚠️|PDT|BLOCKED|🐋|🚨/.test(line)) cls = 'warning';
-    const tm = line.match(/([0-9]{2}:[0-9]{2}):[0-9]{2}/);
-    const t = tm ? tm[1] : '';
-    const msg = line.replace(/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},?[0-9]* /, '');
-    return '<div class="li ' + cls + '"><span class="lt">' + t + '</span><span class="lm">' + msg + '</span></div>';
-  }).join('');
-}
-
-// ── start ──────────────────────────────────────────────────────
-loadData();
-loadLogs();
-
-// Polling intervals
-let dataInterval = setInterval(loadData, 2000);
-let logsInterval = setInterval(loadLogs, 5000);
-
-// Visibility-aware refresh: when tab becomes visible (user switches back
-// to it, unlocks phone, etc), immediately refresh and resume polling.
-// Fixes mobile browser timer throttling — without this, you'd see stale
-// data after locking your phone for a few minutes.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    // Force immediate refresh when page becomes visible
-    loadData();
-    loadLogs();
-  }
-});
-
-// Pulse the LIVE indicator each time fresh data arrives
-const origRender = renderData;
-renderData = function(d) {
-  origRender(d);
-  // Briefly flash the snapshot age indicator green to show fresh data
-  const snap = $('h-snap');
-  if (snap) {
-    snap.style.transition = 'color 0.15s';
-    snap.style.color = 'var(--green)';
-    setTimeout(() => { snap.style.color = ''; }, 200);
-  }
-};
-</script>
-</body>
-</html>
-"""
-
-# ── STARTUP ───────────────────────────────────────────────────────────────────
-def start_threads():
-    threading.Thread(target=snapshot_loop, daemon=True, name="snapshot").start()
-    threading.Thread(target=keepalive_loop, daemon=True, name="keepalive").start()
-    threading.Thread(target=bot_loop, daemon=True, name="bot").start()
-    log.info("🤖 Threads started")
-
-# Start threads at module import (so gunicorn picks them up)
-start_threads()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+        <button class="btn bs" onclick="showModal()">🛑  EMERGE
