@@ -1,33 +1,3 @@
-"""
-Whale Bot v5 — Production Build
-================================
-Clean architecture, debuggable, reliable dashboard.
-
-Design principles:
-1. Dashboard reads ONE source of truth: Alpaca API directly (no stale cache lies)
-2. All API calls have timeouts and fallbacks
-3. /api/debug endpoint exposes everything for diagnosis
-4. Health checks visible on dashboard
-5. Trades and P&L computed deterministically from fills
-
-Render env vars (required):
-  ALPACA_API_KEY
-  ALPACA_SECRET_KEY
-  ALPACA_BASE_URL    (https://paper-api.alpaca.markets or https://api.alpaca.markets)
-  DASHBOARD_PASSWORD
-  RENDER_EXTERNAL_URL (your render URL for keepalive)
-
-Optional env vars:
-  TRADE_SIZE       (default 25)
-  DAILY_GOAL       (default 100)
-  MAX_LOSS         (default 25)
-  STOP_PCT         (default 0.05)
-  TARGET_PCT       (default 0.07)
-  MIN_SCORE        (default 55)
-  MIN_PRICE        (default 10)
-  MAX_DAY_TRADES   (default 2)
-"""
-
 import os, json, time, logging, threading, traceback
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,7 +6,6 @@ import pytz
 import requests
 from flask import Flask, jsonify, request
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
 KEY        = os.environ.get("ALPACA_API_KEY", "")
 SECRET     = os.environ.get("ALPACA_SECRET_KEY", "")
 BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
@@ -46,75 +15,45 @@ PORT       = int(os.environ.get("PORT", 8080))
 KEEPALIVE  = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 TRADE_SIZE   = float(os.environ.get("TRADE_SIZE",   "25"))
-MAX_POSITION = float(os.environ.get("MAX_POSITION", "1000000"))  # safety ceiling, default = no cap
+MAX_POSITION = float(os.environ.get("MAX_POSITION", "1000000"))
 DAILY_GOAL   = float(os.environ.get("DAILY_GOAL",   "100"))
 MAX_LOSS     = float(os.environ.get("MAX_LOSS",     "25"))
 STOP_PCT     = float(os.environ.get("STOP_PCT",     "0.05"))
 TARGET_PCT   = float(os.environ.get("TARGET_PCT",   "0.07"))
 MIN_SCORE    = int(os.environ.get("MIN_SCORE",      "55"))
 MIN_PRICE    = float(os.environ.get("MIN_PRICE",    "10.0"))
-# Bear/inverse ETFs trade far cheaper (SOXS ~$5, UVXY/VXX often <$10) yet are
-# core to the down-day playbook. Give them a lower floor so the $10 MIN_PRICE
-# doesn't silently exclude them — surfaced by the June 2 replay (SOXS was on the
-# watchlist but filtered out on price).
 BEAR_MIN_PRICE = float(os.environ.get("BEAR_MIN_PRICE", "3.0"))
 MAX_DT       = int(os.environ.get("MAX_DAY_TRADES", "2"))
 MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 
-# Anti-overtrade controls (added after live-day churning incident May 4 2026)
-COOLDOWN_MIN       = int(os.environ.get("SYMBOL_COOLDOWN_MIN", "30"))   # min between same-symbol entries
-MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "5"))     # hard cap on round-trips/day
+COOLDOWN_MIN       = int(os.environ.get("SYMBOL_COOLDOWN_MIN", "30"))
+MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "5"))
 
-# ── DYNAMIC DISCOVERY / GAP-AND-GO / VWAP / ORB ───────────────────────────────
-# All three are additive: discovery only widens the scan universe, the gap and
-# ORB layers only ADD score, and the VWAP filter is the one hard gate (and can
-# be disabled). Every piece degrades gracefully — if Alpaca returns nothing the
-# bot falls straight back to its static-watchlist, score-only behaviour.
-
-# (1) Dynamic ticker discovery from Alpaca movers screener
 MOVERS_ENABLED = os.environ.get("MOVERS_ENABLED", "true").lower() == "true"
-MOVERS_COUNT   = int(os.environ.get("MOVERS_COUNT",   "15"))   # top N gainers AND losers
-MOVERS_MIN_CHG = float(os.environ.get("MOVERS_MIN_CHG", "3.0")) # min abs % move to include
+MOVERS_COUNT   = int(os.environ.get("MOVERS_COUNT",   "15"))
+MOVERS_MIN_CHG = float(os.environ.get("MOVERS_MIN_CHG", "3.0"))
 
-# (2) Premarket gap-and-go scanner
-# DEFAULT OFF: the June 2 replay showed IEX premarket is too thin for the
-# explosive names this is meant to catch (movers had 0 premarket bars on IEX).
-# Leave off until the data feed is upgraded to SIP, then set GAP_ENABLED=true.
 GAP_ENABLED   = os.environ.get("GAP_ENABLED", "false").lower() == "true"
-GAP_MIN_PCT   = float(os.environ.get("GAP_MIN_PCT",   "0.04"))   # 4% gap off prior close
-GAP_MIN_PMVOL = int(os.environ.get("GAP_MIN_PMVOL", "50000"))    # min cumulative premarket vol
-GAP_BOOST     = int(os.environ.get("GAP_BOOST",        "12"))    # score boost on confirmed "go"
+GAP_MIN_PCT   = float(os.environ.get("GAP_MIN_PCT",   "0.04"))
+GAP_MIN_PMVOL = int(os.environ.get("GAP_MIN_PMVOL", "50000"))
+GAP_BOOST     = int(os.environ.get("GAP_BOOST",        "12"))
 
-# Guardrails for DYNAMICALLY DISCOVERED names (movers/news, not the curated
-# watchlist). Added after the June 2 replay: the bot shorted a dead-cat bounce
-# in ABVX (down 44% intraday) and got stopped out. Curated watchlist names are
-# exempt; only names the bot pulled in dynamically get this stricter gate.
-DISCOVERED_MAX_CHG  = float(os.environ.get("DISCOVERED_MAX_CHG",  "0.25"))    # reject if already moved >25% off prior close
-DISCOVERED_MIN_DVOL = float(os.environ.get("DISCOVERED_MIN_DVOL", "5000000")) # min cumulative $ volume (liquidity floor)
+DISCOVERED_MAX_CHG  = float(os.environ.get("DISCOVERED_MAX_CHG",  "0.25"))
+DISCOVERED_MIN_DVOL = float(os.environ.get("DISCOVERED_MIN_DVOL", "5000000"))
 
-# (4) NEWS LAST-LAYER — final catalyst confirmation, runs right before execution.
-# Reuses the same Alpaca news feed as discovery, but per-symbol: confirms a
-# setup has a FRESH catalyst behind it (matches the "fresh catalyst only" rule).
-# Default behaviour is additive (boost only); flip NEWS_REQUIRED on to make a
-# fresh catalyst mandatory. Fails OPEN so a news outage can never freeze trading.
 NEWS_LAYER_ENABLED = os.environ.get("NEWS_LAYER_ENABLED", "true").lower() == "true"
-NEWS_REQUIRED      = os.environ.get("NEWS_REQUIRED", "false").lower() == "true"   # hard gate (off by default)
-NEWS_BOOST         = int(os.environ.get("NEWS_BOOST",        "10"))               # score boost when fresh news exists
-NEWS_MAX_AGE_HRS   = float(os.environ.get("NEWS_MAX_AGE_HRS", "24"))              # how recent counts as "fresh"
-NEWS_CACHE_MIN     = int(os.environ.get("NEWS_CACHE_MIN",     "10"))              # per-symbol cache TTL (minutes)
+NEWS_REQUIRED      = os.environ.get("NEWS_REQUIRED", "false").lower() == "true"
+NEWS_BOOST         = int(os.environ.get("NEWS_BOOST",        "10"))
+NEWS_MAX_AGE_HRS   = float(os.environ.get("NEWS_MAX_AGE_HRS", "24"))
+NEWS_CACHE_MIN     = int(os.environ.get("NEWS_CACHE_MIN",     "10"))
 
-# (3) VWAP filter + Opening Range Breakout boost
 VWAP_FILTER   = os.environ.get("VWAP_FILTER", "true").lower() == "true"
-VWAP_MIN_BARS = int(os.environ.get("VWAP_MIN_BARS",     "5"))    # don't gate on < N session bars
+VWAP_MIN_BARS = int(os.environ.get("VWAP_MIN_BARS",     "5"))
 ORB_ENABLED   = os.environ.get("ORB_ENABLED", "true").lower() == "true"
-ORB_MINUTES   = int(os.environ.get("ORB_MINUTES",      "15"))    # opening-range length (minutes)
-ORB_BOOST     = int(os.environ.get("ORB_BOOST",        "12"))    # score boost on OR breakout
+ORB_MINUTES   = int(os.environ.get("ORB_MINUTES",      "15"))
+ORB_BOOST     = int(os.environ.get("ORB_BOOST",        "12"))
 
-# AI Agent integration (optional layer that runs as a separate Render service).
-# When configured, whale-bot calls the agent before placing trades. Agent can
-# VETO trades it considers risky. If agent is down or unset, bot falls back
-# to score-only logic and trades anyway. Always safe.
-AGENT_URL        = os.environ.get("AGENT_URL", "").rstrip("/")  # e.g. https://whale-agent.onrender.com
+AGENT_URL        = os.environ.get("AGENT_URL", "").rstrip("/")
 AGENT_AUTH_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")
 AGENT_TIMEOUT_S  = float(os.environ.get("AGENT_TIMEOUT_S", "8"))
 
@@ -122,10 +61,8 @@ LIVE_MODE = "paper" not in BASE_URL.lower()
 ET = pytz.timezone("America/New_York")
 UTC = pytz.UTC
 
-# ── LOGGING ───────────────────────────────────────────────────────────────────
 LOG_FILE = "/tmp/whale_bot.log"
 
-# Rotate if huge
 try:
     if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
         with open(LOG_FILE, "r") as f:
@@ -135,19 +72,16 @@ try:
 except Exception:
     pass
 
-# Root logger setup that survives gunicorn
 _root = logging.getLogger()
 _root.setLevel(logging.INFO)
 _fmt = logging.Formatter("%(asctime)s %(message)s")
 
-# Always have stream handler
 if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
            for h in _root.handlers):
     _sh = logging.StreamHandler()
     _sh.setFormatter(_fmt)
     _root.addHandler(_sh)
 
-# File handler if writable
 try:
     if not any(isinstance(h, logging.FileHandler) for h in _root.handlers):
         _fh = logging.FileHandler(LOG_FILE, mode="a")
@@ -159,7 +93,6 @@ except Exception:
 log = logging.getLogger("whale")
 log.setLevel(logging.INFO)
 
-# ── WATCHLIST ─────────────────────────────────────────────────────────────────
 TIER1 = ["NVDA", "AMD", "TSLA", "PLTR", "SMCI", "MSTR", "MARA", "RIOT", "SOXL", "TQQQ"]
 BEAR_TICKERS = ["SQQQ", "SPXS", "SDOW", "TZA", "FAZ", "UVXY", "VXX", "SOXS", "TECS", "LABD"]
 
@@ -172,27 +105,21 @@ TICKERS = sorted(set(TIER1 + BEAR_TICKERS + [
     "MU", "CVNA", "SHOP", "SNAP", "RBLX", "DKNG", "PENN", "CHWY", "LYFT",
 ]))
 
-# ── SHARED STATE ──────────────────────────────────────────────────────────────
 _lock = threading.Lock()
 _state = {
     "paused": False,
     "e_stop": False,
     "alerts": [],
     "news_tickers": [],
-    "mover_tickers": [],          # dynamic discovery from Alpaca movers screener
-    "gap_candidates": {},         # sym -> {gap, pm_vol, pm_high, price} from premarket scan
+    "mover_tickers": [],
+    "gap_candidates": {},
     "traded_today": [],
     "lost_today": [],
-    # Anti-overtrade tracking — populated by update_closed_trade_state()
-    "bot_dt_count": 0,            # round-trip day trades the bot itself executed today
-    "completed_trades_today": 0,  # total closed positions today (round trips)
-    "sym_cooldown": {},           # sym -> ISO timestamp until cooldown ends
-    # Visibility into what the bot considered today (helps debug "why no trades")
+    "bot_dt_count": 0,
+    "completed_trades_today": 0,
+    "sym_cooldown": {},
     "best_score_today": 0,
     "best_setup_today": None,
-    # Scheduled jobs fired today (was local to bot_loop, moved here so
-    # reset_if_new_day() actually clears it — otherwise day-2 scans get
-    # silently skipped because the keys carry over from day-1)
     "triggered_today": set(),
     "tracker": {
         "date": datetime.now(ET).strftime("%Y-%m-%d"),
@@ -202,7 +129,6 @@ _state = {
         "total_trades": 0,
         "total_wins": 0,
     },
-    # Health metrics surfaced on dashboard
     "health": {
         "last_alpaca_ok": None,
         "last_alpaca_err": None,
@@ -219,7 +145,6 @@ def _now_et_str():
     return datetime.now(ET).strftime("%H:%M:%S")
 
 def push_alert(msg, level="info"):
-    """Add alert to memory + persist to file. Always log."""
     entry = {"t": _now_et_str(), "m": msg, "l": level}
     with _lock:
         _state["alerts"].append(entry)
@@ -255,7 +180,6 @@ def bump_health(field):
     with _lock:
         _state["health"][field] = _state["health"].get(field, 0) + 1
 
-# ── ALPACA API CLIENT ─────────────────────────────────────────────────────────
 HDR = {
     "APCA-API-KEY-ID": KEY,
     "APCA-API-SECRET-KEY": SECRET,
@@ -263,7 +187,6 @@ HDR = {
 }
 
 def aGet(path, params=None, base=None, timeout=10):
-    """Single Alpaca GET. Tracks health. Returns parsed JSON or raises."""
     url = (base or BASE_URL) + path
     bump_health("alpaca_call_count")
     try:
@@ -299,14 +222,12 @@ def aDel(path, timeout=10):
         update_health("last_alpaca_err", f"{_now_et_str()} {type(e).__name__}: {str(e)[:100]}")
         raise
 
-# Convenience wrappers — all may raise
 def get_account():    return aGet("/v2/account")
 def get_positions():  return aGet("/v2/positions")
 def get_orders_open(): return aGet("/v2/orders", {"status": "open", "limit": 50})
 def get_clock():      return aGet("/v2/clock")
 
 def get_today_fills():
-    """Get today's fills using ET-midnight converted to UTC."""
     now_et = datetime.now(ET)
     today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     after = today_start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -314,13 +235,6 @@ def get_today_fills():
                 params={"after": after, "direction": "asc", "page_size": 100}) or []
 
 def get_recent_fills(days=7):
-    """Get fills from the past N days — used for cross-day FIFO matching
-    so swing trades that close today get correctly counted as wins/losses
-    even though their original buy was on a prior day.
-
-    Note: Alpaca's max page_size for activities is 100. For accounts with
-    more than 100 fills in the lookback window, this would need pagination,
-    but for a bot doing 1-3 trades/day with $25 sizes, 100 covers ~1 month."""
     now_et = datetime.now(ET)
     today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     after_dt = today_start - timedelta(days=days)
@@ -329,37 +243,13 @@ def get_recent_fills(days=7):
                 params={"after": after, "direction": "asc", "page_size": 100}) or []
 
 def get_portfolio_history(period="1A", timeframe="1D"):
-    """Fetch Alpaca's portfolio history for a period.
-    Returns dict with 'equity' (array), 'timestamp' (array), 'base_value' (float).
-    period: 1D, 1W, 1M, 3M, 6M, 1A, all
-    timeframe: 1Min, 5Min, 15Min, 1H, 1D"""
     return aGet("/v2/account/portfolio/history",
                 params={"period": period, "timeframe": timeframe}) or {}
 
-# Period P&L cache — refreshed every 5 minutes (equity moves slowly)
 _period_cache = {"data": None, "ts": None}
 _period_cache_lock = threading.Lock()
 
 def get_period_pnl(force=False):
-    """
-    Return P&L over rolling Daily / Weekly / Monthly / Yearly periods.
-
-    - Daily uses last_equity from /v2/account (= prior session close).
-    - Week/Month/Year use Alpaca's portfolio history endpoint.
-      Each period's base = first equity value in that period's series.
-
-    Cached 5 minutes — these values move slowly and we don't want to hammer
-    Alpaca with 3 history calls every 8 seconds.
-
-    Note on accuracy: rolling periods use Alpaca's defined windows
-    (1W = ~5 trading days, 1M = ~21 days, 1A = ~252 days). They are NOT
-    calendar-aligned (Mon-to-now / 1st-to-now / Jan1-to-now). For most
-    users this distinction is unimportant — both are reasonable measures
-    of recent performance.
-
-    Returns dict with: daily, weekly, monthly, yearly + corresponding
-    _pct fields. Returns zeros if calls fail (dashboard shows '—').
-    """
     now = datetime.now(ET)
     with _period_cache_lock:
         cached = _period_cache["data"]
@@ -370,7 +260,7 @@ def get_period_pnl(force=False):
     result = {
         "daily": 0.0, "weekly": 0.0, "monthly": 0.0, "yearly": 0.0,
         "daily_pct": 0.0, "weekly_pct": 0.0, "monthly_pct": 0.0, "yearly_pct": 0.0,
-        "ok": False,  # True only if at least daily computed
+        "ok": False,
     }
 
     try:
@@ -387,13 +277,11 @@ def get_period_pnl(force=False):
             result["daily_pct"] = round((cur - last_eq) / last_eq * 100, 2)
             result["ok"] = True
 
-        # Fetch each period's history. If a call fails the others still work.
         periods = [("weekly", "1W"), ("monthly", "1M"), ("yearly", "1A")]
         for key, period in periods:
             try:
                 hist = get_portfolio_history(period=period, timeframe="1D")
                 eq_arr = hist.get("equity", []) or []
-                # Filter out null/zero entries (account had no value yet)
                 valid = [float(e) for e in eq_arr if e is not None and float(e) > 0]
                 if valid and cur > 0:
                     base = valid[0]
@@ -411,9 +299,7 @@ def get_period_pnl(force=False):
         _period_cache["ts"] = now
     return result
 
-# ── TRADE PAIRING & P&L ──────────────────────────────────────────────────────
 def _group_fills(fills):
-    """Group partial fills by order_id → list of trades, sorted by time."""
     if not fills:
         return []
     by_order = {}
@@ -453,33 +339,19 @@ def _group_fills(fills):
     return out
 
 def compute_trades_and_pnl(today_fills, lookback_fills=None):
-    """
-    Compute trades for display + W/L + realized P&L.
-
-    today_fills:    fills from today (used for display + identifying today's sells)
-    lookback_fills: optional wider window of fills used for FIFO matching
-                    so swing trades closing today get counted correctly
-                    (their original buy was on a prior day).
-                    If None, defaults to today_fills (no cross-day matching).
-
-    Returns (display_trades, today_wins, today_losses, today_realized_pnl).
-    """
     if lookback_fills is None:
         lookback_fills = today_fills
 
     if not today_fills and not lookback_fills:
         return [], 0, 0, 0.0
 
-    # Order IDs from today — used to decide which matched sells "count" for today
     today_order_ids = {f.get("order_id", "") for f in today_fills if f.get("order_id")}
 
     today_trades = _group_fills(today_fills)
     all_trades   = _group_fills(lookback_fills)
 
-    # Display trades (today only) — strip internal order_id
     display = [{k: v for k, v in t.items() if k != "order_id"} for t in today_trades]
 
-    # FIFO match per symbol across the full lookback window
     by_sym = {}
     for t in all_trades:
         sym = t["sym"]
@@ -508,7 +380,6 @@ def compute_trades_and_pnl(today_fills, lookback_fills=None):
                 matched_qty += take
                 buy["qty"] -= take
                 qty_left  -= take
-            # Only count toward TODAY when this sell happened today
             if matched_qty > 0 and sell["order_id"] in today_order_ids:
                 pnl = (sell["price"] * matched_qty) - cost_basis
                 today_realized += pnl
@@ -520,18 +391,6 @@ def compute_trades_and_pnl(today_fills, lookback_fills=None):
     return display, today_w, today_l, round(today_realized, 2)
 
 def update_closed_trade_state(today_fills, lookback_fills=None):
-    """
-    Walk through today's closed positions (via FIFO matching) and update
-    anti-overtrade state:
-      - lost_today: symbols that had a same-day close at a loss → block re-entry
-      - sym_cooldown: timestamp when a symbol becomes available again (any close)
-      - bot_dt_count: count of round-trip day trades (both legs today)
-      - completed_trades_today: total closed positions today
-
-    Called after every FIFO computation (in the snapshot loop) so guards in
-    execute() always reflect current reality. Idempotent — recomputes from
-    fills each time, doesn't depend on accumulated event handling.
-    """
     if lookback_fills is None:
         lookback_fills = today_fills
     if not today_fills and not lookback_fills:
@@ -540,7 +399,6 @@ def update_closed_trade_state(today_fills, lookback_fills=None):
     today_order_ids = {f.get("order_id", "") for f in today_fills if f.get("order_id")}
     all_trades = _group_fills(lookback_fills)
 
-    # Group by symbol with order_id + time
     by_sym = {}
     for t in all_trades:
         sym = t["sym"]
@@ -554,7 +412,7 @@ def update_closed_trade_state(today_fills, lookback_fills=None):
         })
 
     new_lost = set()
-    new_cooldown = {}  # sym -> latest sell time (we'll compute cooldown end from this)
+    new_cooldown = {}
     bot_dt = 0
     completed = 0
 
@@ -578,35 +436,28 @@ def update_closed_trade_state(today_fills, lookback_fills=None):
                 qty_left -= take
 
             if matched_qty > 0 and sell["order_id"] in today_order_ids:
-                # This sell closed (or partly closed) a position TODAY
                 completed += 1
                 if buy_was_today:
-                    bot_dt += 1  # round-trip day trade
+                    bot_dt += 1
                 pnl = (sell["price"] * matched_qty) - cost_basis
                 if pnl < 0:
                     new_lost.add(sym)
-                # Track latest sell time per symbol — used for cooldown
                 prev = new_cooldown.get(sym, "")
                 if sell["time"] > prev:
                     new_cooldown[sym] = sell["time"]
 
-    # Convert cooldown sell-times → ET-aware "available again at" timestamps
     cooldown_until = {}
     now = datetime.now(ET)
     for sym, sell_time_str in new_cooldown.items():
         try:
-            # sell_time_str format is "YYYY-MM-DD HH:MM:SS" in UTC (from fill records)
             sold_utc = datetime.strptime(sell_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
             cooldown_end = sold_utc + timedelta(minutes=COOLDOWN_MIN)
-            # Only keep if cooldown hasn't expired yet
             if cooldown_end > now.astimezone(UTC):
                 cooldown_until[sym] = cooldown_end.astimezone(ET).isoformat()
         except Exception:
-            # Fallback: cooldown from now
             cooldown_until[sym] = (now + timedelta(minutes=COOLDOWN_MIN)).isoformat()
 
     with _lock:
-        # Add newly-lost symbols (don't remove existing — losses are sticky for the day)
         for s in new_lost:
             if s not in _state["lost_today"]:
                 _state["lost_today"].append(s)
@@ -614,61 +465,48 @@ def update_closed_trade_state(today_fills, lookback_fills=None):
         _state["completed_trades_today"] = completed
         _state["sym_cooldown"] = cooldown_until
 
-# ── DASHBOARD DATA — single source of truth ──────────────────────────────────
 class DataSnapshot:
-    """
-    One snapshot of everything the dashboard needs.
-    Fetched fresh every refresh. Cached briefly to absorb mobile refresh bursts.
-    """
     def __init__(self):
         self.acct = {}
         self.positions = []
         self.orders = []
         self.clock = {}
-        self.fills = []           # today's fills (for display)
-        self.lookback_fills = []  # past 7 days (for cross-day FIFO matching)
-        self.period_pnl = {}      # rolling D/W/M/Y P&L
-        self.errors = []  # what failed during fetch
+        self.fills = []
+        self.lookback_fills = []
+        self.period_pnl = {}
+        self.errors = []
 
     def fetch(self):
-        """Fetch all dashboard data. Each call wrapped — partial data is OK."""
-        # Account
         try:
             self.acct = get_account()
         except Exception as e:
             self.errors.append(f"account: {e}")
 
-        # Positions
         try:
             self.positions = get_positions()
         except Exception as e:
             self.errors.append(f"positions: {e}")
 
-        # Orders
         try:
             self.orders = get_orders_open()
         except Exception as e:
             self.errors.append(f"orders: {e}")
 
-        # Clock
         try:
             self.clock = get_clock()
         except Exception as e:
             self.errors.append(f"clock: {e}")
 
-        # Fills (today only — for display)
         try:
             self.fills = get_today_fills()
         except Exception as e:
             self.errors.append(f"fills: {e}")
 
-        # Recent fills (past 7 days — for cross-day FIFO matching of swing closes)
         try:
             self.lookback_fills = get_recent_fills(days=7)
         except Exception as e:
             self.errors.append(f"lookback_fills: {e}")
 
-        # Period P&L (cached internally — only hits Alpaca every 5 min)
         try:
             self.period_pnl = get_period_pnl()
         except Exception as e:
@@ -676,18 +514,14 @@ class DataSnapshot:
 
         return self
 
-
-# Snapshot cache — refreshed every 8 seconds
 _snap_lock = threading.Lock()
 _snap_data = {"snap": None, "ts": None}
 
-# Last-known-good values per piece — used when a single fetch fails
 _last_good = {"acct": {}, "positions": [], "orders": [], "clock": {}, "fills": [],
               "lookback_fills": [], "period_pnl": {}}
 _last_good_lock = threading.Lock()
 
 def get_snapshot(max_age_s=4):
-    """Get cached snapshot if fresh, else refetch."""
     now = datetime.now(ET)
     with _snap_lock:
         s = _snap_data["snap"]
@@ -698,7 +532,6 @@ def get_snapshot(max_age_s=4):
 
     snap = DataSnapshot().fetch()
 
-    # Merge with last-known-good — if a piece failed this time, use last good value
     with _last_good_lock:
         if snap.acct:      _last_good["acct"]      = snap.acct
         else:              snap.acct      = dict(_last_good["acct"])
@@ -730,7 +563,6 @@ def get_snapshot(max_age_s=4):
         _snap_data["ts"] = now
     return snap
 
-# ── INDICATORS ────────────────────────────────────────────────────────────────
 def calc_rsi(bars, p=14):
     if len(bars) < p + 1:
         return 50
@@ -758,21 +590,13 @@ def calc_ema(bars, p=9):
         e = x * k + e * (1 - k)
     return round(e, 2)
 
-# ── SESSION-ANCHORED BARS (for VWAP + ORB) ────────────────────────────────────
 def _et_today_at(hour, minute):
-    """Today's HH:MM in ET as an aware datetime."""
     return datetime.now(ET).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 def _iso_utc(dt):
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def get_scan_minute_bars(sym, timeout=8):
-    """1-minute bars for VWAP + ORB.
-
-    Anchored to today's regular-session open (9:30 ET) so VWAP is a true
-    intraday session VWAP rather than a rolling 60-minute average. Before the
-    open we just grab the most recent 60 bars so premarket scans still have
-    something to work with (VWAP filter / ORB simply won't trigger yet)."""
     now = datetime.now(ET)
     open_et = _et_today_at(9, 30)
     params = {"timeframe": "1Min", "feed": "iex"}
@@ -784,10 +608,6 @@ def get_scan_minute_bars(sym, timeout=8):
     return aGet(f"/v2/stocks/{sym}/bars", params, DATA_URL, timeout=timeout).get("bars", [])
 
 def calc_opening_range(bars, minutes=ORB_MINUTES):
-    """High/low of the first `minutes` of the regular session.
-
-    Returns (or_high, or_low, complete). `complete` is False until the opening
-    range window has fully elapsed, so a breakout can't be called prematurely."""
     if not bars:
         return None, None, False
     open_et = _et_today_at(9, 30)
@@ -804,7 +624,6 @@ def calc_opening_range(bars, minutes=ORB_MINUTES):
     complete = datetime.now(ET) >= or_end
     return hi, lo, complete
 
-# ── MARKET REGIME ─────────────────────────────────────────────────────────────
 _regime = {"ts": None, "ok": True, "chg": 0.0}
 
 def market_regime():
@@ -828,7 +647,6 @@ def market_regime():
     except Exception:
         return True, 0.0
 
-# ── SCANNER ───────────────────────────────────────────────────────────────────
 def whale_tier(snap):
     d = snap.get("dailyBar", {})
     p = snap.get("prevDailyBar", {})
@@ -877,19 +695,12 @@ def score_ticker(sym, snap, dbars, mbars, healthy=True):
             score += 15 if dist > 0.01 else 8 if dist > -0.005 else 0
         else:
             score += 15 if dist < -0.01 else 8 if dist < 0.005 else 0
-        # Hard VWAP filter: a long must be trading ABOVE session VWAP, a short
-        # BELOW it. Skipped until enough session bars exist, because VWAP is
-        # pure noise in the first minutes after the open and would reject
-        # everything. Disable entirely with VWAP_FILTER=false.
         if VWAP_FILTER and len(mbars) >= VWAP_MIN_BARS:
             if direction == "LONG" and cur < v:
                 return 0, direction
             if direction == "SHORT" and cur > v:
                 return 0, direction
 
-    # ── ORB: opening-range breakout boost ─────────────────────────────────────
-    # Reward names that clear the first ORB_MINUTES high (long) or low (short).
-    # Only counts once the opening range has fully formed.
     if ORB_ENABLED and mbars:
         or_hi, or_lo, complete = calc_opening_range(mbars, ORB_MINUTES)
         if complete and or_hi and or_lo:
@@ -898,10 +709,6 @@ def score_ticker(sym, snap, dbars, mbars, healthy=True):
             elif direction == "SHORT" and cur < or_lo:
                 score += ORB_BOOST
 
-    # ── Gap-and-go confirmation boost ─────────────────────────────────────────
-    # If premarket flagged this as a gapper, the "go" is price clearing the
-    # premarket high on an up-gap (the classic continuation trigger). Down-gap
-    # names get the boost on the short side.
     if GAP_ENABLED:
         with _lock:
             gc = _state.get("gap_candidates", {}).get(sym)
@@ -930,9 +737,6 @@ def scan_one(sym, healthy, tsize):
         price_floor = BEAR_MIN_PRICE if sym in BEAR_TICKERS else MIN_PRICE
         if cur < price_floor or not pc:
             return None
-        # Discovered-name guardrails. Curated watchlist names skip this; only
-        # dynamically pulled-in names (movers/news/gappers) face the stricter
-        # gate, so the bot doesn't chase blow-off moves or illiquid traps.
         if sym not in TICKERS:
             chg0 = (cur - pc) / pc
             if abs(chg0) > DISCOVERED_MAX_CHG:
@@ -948,8 +752,6 @@ def scan_one(sym, healthy, tsize):
         sc, direction = score_ticker(sym, snap, dbars, mbars, healthy)
         if sc < MIN_SCORE:
             return None
-        # ── NEWS LAST-LAYER: confirm a fresh catalyst before committing ──
-        # Runs after every other layer — the final check before a setup is real.
         news = news_confirmation(sym)
         if NEWS_REQUIRED and not news["fresh"]:
             log.debug(f"skip {sym}: no fresh catalyst (news layer)")
@@ -959,10 +761,6 @@ def scan_one(sym, healthy, tsize):
         vr  = d.get("v", 0) / max(p.get("v", 1), 1)
         chg = (cur - pc) / pc
         tier, _ = whale_tier(snap)
-        # Whole-share sizing that scales purely via TRADE_SIZE env var.
-        # int() floors, so a stock too expensive for the current TRADE_SIZE
-        # yields 0 shares and gets skipped cleanly (no forced 1-share blowups).
-        # Raising TRADE_SIZE later auto-unlocks pricier names — no code change.
         shares = int(tsize / cur)
         if shares < 1:
             log.debug(f"skip {sym}: ${cur:.2f}/share too expensive for ${tsize:.0f} size")
@@ -1001,10 +799,6 @@ def full_scan(label="SCAN"):
 
     push_alert(f"🔍 {label}: scanning {len(all_tickers)} tickers ({regime_label}, threshold {effective_score})", "info")
 
-    # Position size in dollars — scales PURELY via the TRADE_SIZE env var.
-    # Set TRADE_SIZE=25 to start; raise it (e.g. 3300) for larger capital and
-    # the $100/day goal. No code change needed — just the env var.
-    # MAX_POSITION is an optional safety ceiling (default very high = no cap).
     tsize = min(TRADE_SIZE, MAX_POSITION)
 
     setups = []
@@ -1018,7 +812,6 @@ def full_scan(label="SCAN"):
             except Exception:
                 pass
 
-    # Bear boost
     if not ok:
         for s in setups:
             if s["sym"] in BEAR_TICKERS:
@@ -1027,8 +820,6 @@ def full_scan(label="SCAN"):
     setups.sort(key=lambda x: (x["tier"], x["score"]), reverse=True)
     top = setups[:5]
 
-    # Track best setup observed today so user can see what the bot considered
-    # even when no trades fired (useful for debugging "why didn't it trade")
     if top:
         new_best = top[0]
         with _lock:
@@ -1056,7 +847,6 @@ def full_scan(label="SCAN"):
 
     return top, ok
 
-# ── NEWS ──────────────────────────────────────────────────────────────────────
 def fetch_news():
     try:
         since = (datetime.now(ET) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1075,18 +865,9 @@ def fetch_news():
     except Exception as e:
         log.debug(f"news: {e}")
 
-# ── NEWS LAST-LAYER: per-symbol catalyst confirmation ─────────────────────────
-_news_cache = {}   # sym -> (epoch_fetched, result_dict)
+_news_cache = {}
 
 def news_confirmation(sym):
-    """Final pre-trade layer: is there a FRESH catalyst behind this setup?
-
-    Queries the same Alpaca news endpoint used by fetch_news(), but scoped to
-    one symbol over the NEWS_MAX_AGE_HRS window. Returns recency/coverage so the
-    caller can boost (or, if NEWS_REQUIRED, require) a catalyst. Cached per
-    symbol so the continuous 2-minute scans don't hammer the endpoint. Fails
-    OPEN (fresh=False, never blocks on its own) on any error, so a news outage
-    only removes the boost — it can never freeze the bot."""
     if not NEWS_LAYER_ENABLED:
         return {"fresh": False, "count": 0, "age_min": None, "headline": None}
     now = time.time()
@@ -1120,15 +901,7 @@ def news_confirmation(sym):
         _news_cache[sym] = (now, res)
     return res
 
-# ── DYNAMIC DISCOVERY: ALPACA MOVERS ──────────────────────────────────────────
 def fetch_movers():
-    """Widen the scan universe with the day's biggest movers.
-
-    Pulls Alpaca's stocks movers screener (top gainers + losers) and adds any
-    name not already on the static watchlist that's moving at least
-    MOVERS_MIN_CHG percent. Mirrors fetch_news(): discovery only — direction
-    and conviction are still decided entirely by score_ticker(). Degrades
-    silently if the screener is unavailable on the data plan."""
     if not MOVERS_ENABLED:
         return
     try:
@@ -1152,23 +925,14 @@ def fetch_movers():
     except Exception as e:
         log.debug(f"movers: {e}")
 
-# ── PREMARKET GAP-AND-GO SCANNER ──────────────────────────────────────────────
 def premarket_scan():
-    """Build the gap-and-go watchlist before the open.
-
-    Finds names gapping at least GAP_MIN_PCT off the prior close on real
-    premarket volume (>= GAP_MIN_PMVOL), and records each one's premarket high.
-    The opening scans then confirm the "go" — price clearing that premarket
-    high — before score_ticker() awards the gap boost. Alerts only here; no
-    orders are placed premarket (the bracket logic needs a live session)."""
     if not GAP_ENABLED:
         return
-    # Refresh movers first so the gap universe sees today's hot names too.
     fetch_movers()
     with _lock:
         extra = list(_state.get("mover_tickers", [])) + list(_state.get("news_tickers", []))
     universe = sorted(set(TICKERS + extra))
-    pm_start = _iso_utc(_et_today_at(4, 0))   # premarket session opens 4:00 ET
+    pm_start = _iso_utc(_et_today_at(4, 0))
 
     def _check(sym):
         try:
@@ -1212,14 +976,7 @@ def premarket_scan():
     else:
         push_alert("🌅 Premarket scan — no qualifying gappers", "info")
 
-# ── AI AGENT INTEGRATION ──────────────────────────────────────────────────────
 def ask_agent(setup, swing=False):
-    """
-    Ask the agent service to evaluate this setup. Returns dict:
-      {"decision": "APPROVE"|"VETO", "confidence": 0-1, "reasoning": str, ...}
-    Always returns APPROVE if agent is unconfigured or unreachable — never blocks
-    the bot from trading just because the agent layer has a problem.
-    """
     if not AGENT_URL:
         return {"decision": "APPROVE", "reasoning": "agent not configured",
                 "confidence": 1.0, "skipped": True}
@@ -1265,7 +1022,6 @@ def ask_agent(setup, swing=False):
         return {"decision": "APPROVE", "reasoning": f"agent error: {e} — fallback",
                 "confidence": 0.5, "agent_failed": True}
 
-# ── ORDERS ────────────────────────────────────────────────────────────────────
 def place_order(setup, swing=False):
     side = "buy" if setup["dir"] == "LONG" else "sell"
     body = {
@@ -1299,19 +1055,12 @@ def is_paused():
         return _state["paused"] or _state["e_stop"]
 
 def is_occupied():
-    """True if any open positions or orders."""
     try:
         return bool(get_positions() or get_orders_open())
     except Exception:
-        return True  # safer to assume occupied on error
+        return True
 
 def reset_if_new_day():
-    """
-    Reset all daily state at midnight ET (NOT UTC).
-    Server runs in UTC, so we must explicitly convert. Without this, the bot
-    resets at midnight UTC (8pm ET, hours AFTER market close) and never resets
-    at the actual start of a new trading day.
-    """
     today = datetime.now(ET).strftime("%Y-%m-%d")
     reset_occurred = False
     old_date = None
@@ -1334,7 +1083,6 @@ def reset_if_new_day():
             _state["best_setup_today"] = None
             _state["triggered_today"] = set()
             reset_occurred = True
-    # IMPORTANT: push_alert acquires _lock so call it OUTSIDE the with-block
     if reset_occurred:
         push_alert(f"🌅 New trading day ({old_date} → {today}) — daily state reset", "info")
         log.info(f"Day reset: {old_date} → {today}")
@@ -1349,8 +1097,6 @@ def execute(setups, label=""):
     if not setups:
         return
 
-    # ── HARD CAP: total trades today ─────────────────────────────────
-    # Stops runaway churning regardless of symbol or P&L
     with _lock:
         completed = _state.get("completed_trades_today", 0)
     if completed >= MAX_TRADES_PER_DAY:
@@ -1359,9 +1105,6 @@ def execute(setups, label=""):
             f"no new trades today. Bot will resume tomorrow.", "warning")
         return
 
-    # ── DAY TRADE LIMIT ──────────────────────────────────────────────
-    # Use whichever counter is higher (Alpaca's or bot's own count) so
-    # this works even on accounts where Alpaca doesn't enforce PDT.
     alpaca_dt = get_dt_used()
     with _lock:
         bot_dt = _state.get("bot_dt_count", 0)
@@ -1371,7 +1114,6 @@ def execute(setups, label=""):
         push_alert(
             f"⚠️ Day trade limit ({dt_used}/{MAX_DT}) — swing only", "warning")
 
-    # ── FILTER: skip lost symbols + cooldowns ────────────────────────
     with _lock:
         lost = list(_state.get("lost_today", []))
         cooldowns = dict(_state.get("sym_cooldown", {}))
@@ -1400,7 +1142,6 @@ def execute(setups, label=""):
         filtered.append(s)
 
     if not filtered:
-        # Show user why no trades are firing
         blocked_msgs = []
         for s in setups[:3]:
             reason = is_blocked(s["sym"])
@@ -1412,13 +1153,12 @@ def execute(setups, label=""):
 
     best = filtered[0]
 
-    # Risk cap — never bet more than MAX_RISK_PCT * 100 of cash on one position
     try:
         cash = float(get_account().get("cash", 0))
         position_value = best["shares"] * best["price"]
         max_position = cash * (MAX_RISK_PCT * 100)
         if position_value > max_position:
-            new_shares = int(max_position / best["price"])  # floor, no forced minimum
+            new_shares = int(max_position / best["price"])
             if new_shares < 1:
                 push_alert(f"⚠️ {best['sym']} skipped: even 1 share (${best['price']:.0f}) exceeds risk cap (${max_position:.0f})", "warning")
                 return
@@ -1431,18 +1171,12 @@ def execute(setups, label=""):
     tag = "🚨EXTREME" if best["tier"] == 3 else "🐋WHALE" if best["tier"] >= 1 else "📊"
     push_alert(f"{tag} {best['dir']} {best['sym']} | Score:{best['score']} | {best['chg']:+.1f}% | Vol:{best['vol']}x", "info")
 
-    # Compute effective threshold based on regime — same logic as scanner so
-    # any setup that PASSED the scan can fire as a swing when DT is maxed.
-    # Previously this was hardcoded to 65, which was stricter than the
-    # bear-day scan threshold (45). Result: bot would scan, find setups,
-    # then refuse to trade them. Now: scan threshold == trade threshold.
     try:
         regime_ok, _ = market_regime()
     except Exception:
         regime_ok = True
     effective_threshold = MIN_SCORE if regime_ok else max(MIN_SCORE - 10, 40)
 
-    # Decide swing vs day before consulting agent (agent benefits from knowing this)
     will_swing = False
     will_trade = False
     if best["tier"] == 3:
@@ -1463,10 +1197,6 @@ def execute(setups, label=""):
     if not will_trade:
         return
 
-    # ── AI AGENT VETO CHECK ──────────────────────────────────────────
-    # Ask the optional agent layer for a second opinion. If agent is configured
-    # and returns VETO, skip the trade. If not configured or unreachable,
-    # ask_agent() returns APPROVE so we don't block.
     if AGENT_URL:
         agent_resp = ask_agent(best, swing=will_swing)
         a_decision = agent_resp.get("decision", "APPROVE")
@@ -1497,10 +1227,6 @@ def execute(setups, label=""):
         with _lock:
             if best["sym"] not in _state["traded_today"]:
                 _state["traded_today"].append(best["sym"])
-            # Pre-emptively set a cooldown immediately on entry so we don't
-            # buy the same symbol again before its OCO closes (otherwise the
-            # next continuous scan could re-enter while position is still open
-            # if there's any race condition).
             _state["sym_cooldown"][best["sym"]] = (
                 datetime.now(ET) + timedelta(minutes=COOLDOWN_MIN)
             ).isoformat()
@@ -1515,25 +1241,6 @@ def monitor():
         pass
 
 def protect_positions():
-    """
-    Verify every open position has both stop-loss and take-profit protection.
-    If a position is unprotected or only partially protected, place a fresh
-    OCO (One-Cancels-Other) order with both legs as GTC.
-
-    Why OCO instead of two separate orders:
-      Alpaca rejects two independent sell-to-close orders for the same shares
-      with HTTP 403 (wash-trade prevention). OCO bundles SL + TP as ONE order
-      so Alpaca's risk engine accepts it. When one leg fills, the other auto-cancels.
-
-    Algorithm:
-      1. Scan open orders per symbol — count protective legs (stop + limit)
-      2. If position already has BOTH protective legs → leave alone (idempotent)
-      3. Otherwise:
-         a. Cancel any existing solo close orders for that symbol (frees up shares)
-         b. Place fresh OCO with both legs as GTC
-
-    Runs at market open + periodically through the session. Safe to call repeatedly.
-    """
     try:
         positions = get_positions()
         if not positions:
@@ -1545,7 +1252,6 @@ def protect_positions():
             push_alert(f"⚠️ Protection check: can't fetch orders ({e})", "warning")
             return
 
-        # Group existing close orders per symbol: stop count, limit count, ids
         by_sym = {}
         for o in open_orders:
             sym = o.get("symbol", "")
@@ -1555,7 +1261,6 @@ def protect_positions():
             if not sym or not oid:
                 continue
             d = by_sym.setdefault(sym, {"stops": [], "limits": [], "all_close": []})
-            # Track all sell/buy-to-close orders for this symbol
             d["all_close"].append({"id": oid, "side": oside, "type": otype})
             if "stop" in otype:
                 d["stops"].append(oid)
@@ -1577,13 +1282,11 @@ def protect_positions():
             has_stop = len(existing["stops"]) > 0
             has_limit = len(existing["limits"]) > 0
 
-            # If both legs already exist, position is fully protected — skip
             if has_stop and has_limit:
                 continue
 
             close_side = "sell" if side == "long" else "buy"
 
-            # Compute fresh SL/TP from entry price
             if side == "long":
                 sl_price = round(entry * (1 - STOP_PCT), 2)
                 tp_price = round(entry * (1 + TARGET_PCT), 2)
@@ -1591,11 +1294,8 @@ def protect_positions():
                 sl_price = round(entry * (1 + STOP_PCT), 2)
                 tp_price = round(entry * (1 - TARGET_PCT), 2)
 
-            # Cancel any existing solo close orders for this symbol — frees up
-            # the shares so the OCO can be accepted (Alpaca blocks duplicates)
             cancelled = 0
             for o in existing["all_close"]:
-                # Only cancel orders going the same direction as our close
                 if o["side"] != close_side:
                     continue
                 try:
@@ -1606,10 +1306,8 @@ def protect_positions():
 
             if cancelled:
                 push_alert(f"🧹 Cancelled {cancelled} solo close order(s) for {sym} to place OCO", "info")
-                # Brief wait so Alpaca processes the cancellations before OCO
                 time.sleep(0.5)
 
-            # Place OCO — single order with both legs
             try:
                 aPost("/v2/orders", {
                     "symbol": sym,
@@ -1635,14 +1333,12 @@ def eod():
     monitor()
     push_alert("🔔 EOD report", "info")
 
-# ── BOT JOB & LOOP ────────────────────────────────────────────────────────────
 def job(label):
     if is_paused():
         return
     setups, ok = full_scan(label)
     now = datetime.now(ET)
     if now.hour == 9 and now.minute < 45 and label not in ("PREMARKET 8AM", "OPENING RANGE"):
-        # Opening 9:30-9:44 — only high conviction
         high = [s for s in setups if s["tier"] >= 2 or s["score"] >= 80]
         if high:
             push_alert(f"🚀 High conviction at open — {high[0]['sym']} score:{high[0]['score']}", "warning")
@@ -1653,7 +1349,6 @@ def job(label):
     execute(setups, label)
 
 def bot_loop():
-    """Main scheduled loop."""
     restore_alerts()
     push_alert(f"🐋 Whale Bot v5 online — {'🔴 LIVE' if LIVE_MODE else '📝 PAPER'}", "success")
     push_alert(f"Watching {len(TICKERS)} tickers | ${TRADE_SIZE}/trade | "
@@ -1661,8 +1356,6 @@ def bot_loop():
 
     time.sleep(8)
 
-    # Startup: if there are existing positions (e.g. from prior session),
-    # immediately verify they're protected. Critical for live trading.
     try:
         if get_positions():
             push_alert("🛡️ Startup: checking position protection…", "info")
@@ -1670,7 +1363,6 @@ def bot_loop():
     except Exception as e:
         push_alert(f"⚠️ Startup protection check err: {e}", "warning")
 
-    # Startup scan if open
     try:
         if get_clock().get("is_open"):
             push_alert("🔄 Market open — startup scan", "info")
@@ -1680,10 +1372,6 @@ def bot_loop():
     except Exception as e:
         push_alert(f"⚠️ Startup err: {e}", "warning")
 
-    # NOTE: triggered_today is now in _state so reset_if_new_day() can clear it.
-    # The old local `triggered = set()` was a real bug — if the bot stayed alive
-    # across midnight ET, day-2 scheduled scans got silently skipped because
-    # their keys were already in the set from day 1.
     while True:
         try:
             update_health("last_loop_at", _now_et_str())
@@ -1696,7 +1384,7 @@ def bot_loop():
                 "7:30":  premarket_scan,
                 "8:00":  lambda: (premarket_scan(), job("PREMARKET 8AM")),
                 "9:15":  premarket_scan,
-                "9:30":  lambda: (protect_positions(), job("OPENING RANGE")),  # protect first
+                "9:30":  lambda: (protect_positions(), job("OPENING RANGE")),
                 "9:45":  lambda: job("ORB BREAKOUT"),
                 "10:00": lambda: job("MOMENTUM 10AM"),
                 "12:00": lambda: job("MIDDAY"),
@@ -1719,8 +1407,6 @@ def bot_loop():
                 fetch_movers()
                 mark(f"news_{key}")
             elif 9 <= h < 16 and m % 10 == 0 and f"protect_{key}" not in triggered:
-                # Protection sweep every 10 minutes during session — catches
-                # any position that lost its bracket legs for any reason
                 try:
                     protect_positions()
                 except Exception as e:
@@ -1738,8 +1424,6 @@ def bot_loop():
                     push_alert(f"⚠️ Scan err: {e}", "warning")
                 mark(key)
 
-            # Belt-and-suspenders midnight ET reset — redundant with
-            # reset_if_new_day() clearing triggered_today, but harmless
             if h == 0 and m == 1 and "midnight" not in triggered:
                 with _lock:
                     _state["triggered_today"].clear()
@@ -1751,7 +1435,6 @@ def bot_loop():
             time.sleep(60)
 
 def keepalive_loop():
-    """Ping self every 4.5min to prevent Render sleep + give visible proof of life."""
     time.sleep(120)
     while True:
         try:
@@ -1759,22 +1442,12 @@ def keepalive_loop():
                 requests.get(KEEPALIVE, timeout=10)
                 push_alert("💓 Keepalive ping sent", "info")
             else:
-                # No KEEPALIVE URL set — at least log that we're alive
                 push_alert("💓 Bot heartbeat (no keepalive URL configured)", "info")
         except Exception as e:
             push_alert(f"⚠️ Keepalive failed: {e}", "warning")
         time.sleep(270)
 
 def snapshot_loop():
-    """Refresh dashboard snapshot every 4s in background — keeps mobile fast.
-    The cache TTL in get_snapshot() matches this interval to avoid double-fetching.
-
-    CRITICAL: also updates anti-overtrade state (lost_today, cooldowns, bot
-    day-trade count) here — NOT just in api_data(). Previously this only ran
-    when the dashboard was polled over HTTP, so if no browser was open the bot's
-    scan loop read stale lost_today and could re-enter a same-day loser (this
-    caused the May 18 HCAI re-entry: -$1.66). Now it refreshes every 4s no
-    matter what, so the scan loop always sees fresh state."""
     time.sleep(2)
     while True:
         try:
@@ -1782,7 +1455,6 @@ def snapshot_loop():
             with _snap_lock:
                 _snap_data["snap"] = snap
                 _snap_data["ts"] = datetime.now(ET)
-            # Keep anti-overtrade state fresh independent of HTTP traffic
             try:
                 update_closed_trade_state(snap.fills or [], snap.lookback_fills or [])
             except Exception as e:
@@ -1791,7 +1463,6 @@ def snapshot_loop():
             log.debug(f"snap loop: {e}")
         time.sleep(4)
 
-# ── FLASK APP ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 def authed():
@@ -1799,19 +1470,13 @@ def authed():
     return tok == DASH_PASS
 
 def agent_authed():
-    """Auth check for endpoints the agent calls — accepts AGENT_AUTH_TOKEN OR DASH_PASS."""
     if authed():
         return True
     tok = request.headers.get("X-Auth-Token", "")
     return bool(AGENT_AUTH_TOKEN) and tok == AGENT_AUTH_TOKEN
 
-# ── SINGLE SOURCE OF TRUTH: /api/data ────────────────────────────────────────
 @app.route("/api/data")
 def api_data():
-    """
-    Build full dashboard payload from one snapshot.
-    Always returns 200 with what we have — never lies about trades that exist.
-    """
     snap = get_snapshot()
 
     acct = snap.acct or {}
@@ -1821,14 +1486,10 @@ def api_data():
     fills = snap.fills or []
     lookback_fills = snap.lookback_fills or []
 
-    # Compute trades + realized P&L from fills (cross-day matching for swing closes)
     trades, wins, losses, realized = compute_trades_and_pnl(fills, lookback_fills)
 
-    # Update anti-overtrade state from the same fill data (lost_today,
-    # cooldowns, bot day-trade count, total completed trades)
     update_closed_trade_state(fills, lookback_fills)
 
-    # Account values
     try:
         equity = float(acct.get("equity", 0))
     except (ValueError, TypeError):
@@ -1843,11 +1504,8 @@ def api_data():
         dt_used = 0
     pdt_flag = bool(acct.get("pattern_day_trader", False))
 
-    # Today P&L = (equity now - equity at start of day) — Alpaca's last_equity
-    # is the equity at previous market close, which is accurate.
     daily_pnl = round(equity - last_eq, 2)
 
-    # Unrealized from open positions for display detail
     unrealized = 0.0
     for p in positions:
         try:
@@ -1856,7 +1514,6 @@ def api_data():
             pass
     unrealized = round(unrealized, 2)
 
-    # Win rate (today + history)
     with _lock:
         tw = _state["tracker"].get("total_wins", 0) + wins
         tt = _state["tracker"].get("total_trades", 0) + wins + losses
@@ -1871,9 +1528,6 @@ def api_data():
         health = dict(_state["health"])
     win_rate = round(tw / tt * 100, 1) if tt else 0.0
 
-    # Period P&L: use cached week/month/year (they move slowly), but always
-    # use LIVE daily so it matches the main Today's P&L card. Otherwise the
-    # cached daily can lag by up to 5 minutes and confuse the user.
     pp = dict(snap.period_pnl) if snap.period_pnl else {}
     pp["daily"] = daily_pnl
     pp["daily_pct"] = round(daily_pnl / last_eq * 100, 2) if last_eq else 0.0
@@ -1934,7 +1588,6 @@ def api_logs():
 
 @app.route("/api/debug")
 def api_debug():
-    """Diagnostic endpoint — exposes everything for troubleshooting."""
     try:
         snap = get_snapshot()
         with _lock:
@@ -1988,7 +1641,6 @@ def api_debug():
 
 @app.route("/api/health")
 def api_health():
-    """Simple health check for Render."""
     return jsonify({"ok": True, "live_mode": LIVE_MODE})
 
 @app.route("/api/pause", methods=["POST"])
@@ -2030,7 +1682,6 @@ def api_estop():
 
 @app.route("/api/protect", methods=["POST"])
 def api_protect():
-    """Manually trigger position protection check. Re-places missing SL/TP as GTC."""
     if not agent_authed():
         return jsonify({"error": "Wrong password"}), 401
     try:
@@ -2039,18 +1690,8 @@ def api_protect():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── ADMIN ENDPOINTS (callable by agent monitor) ──────────────────────────────
 @app.route("/api/admin/health", methods=["GET"])
 def api_admin_health():
-    """
-    Detailed health diagnostic for the agent monitor. Returns full state in
-    one call so the agent can detect:
-      - day rollover failures (tracker.date != today_ET)
-      - bot silence (last_loop_at, last_scan_at)
-      - unprotected positions / orphan orders
-      - error rate spikes
-      - state staleness
-    """
     if not agent_authed():
         return jsonify({"error": "unauthorized"}), 401
     try:
@@ -2067,7 +1708,6 @@ def api_admin_health():
             best_score = _state.get("best_score_today", 0)
             lost_today = list(_state.get("lost_today", []))
 
-        # Determine unprotected positions / orphan orders for the monitor
         positions = snap.positions or []
         orders    = snap.orders or []
 
@@ -2093,7 +1733,6 @@ def api_admin_health():
             if s not in position_syms:
                 orphans.extend(info["ids"])
 
-        # Compute staleness
         last_loop = health.get("last_loop_at", "")
         last_scan = health.get("last_scan_at", "")
         try:
@@ -2131,13 +1770,11 @@ def api_admin_health():
 
 @app.route("/api/admin/force_reset", methods=["POST"])
 def api_admin_force_reset():
-    """Force reset_if_new_day() — clears triggered_today, lost_today, etc."""
     if not agent_authed():
         return jsonify({"error": "unauthorized"}), 401
     try:
         with _lock:
             old_date = _state["tracker"]["date"]
-            # Force the comparison to trigger reset
             _state["tracker"]["date"] = "1970-01-01"
         reset_if_new_day()
         with _lock:
@@ -2149,7 +1786,6 @@ def api_admin_force_reset():
 
 @app.route("/api/admin/cancel_orphans", methods=["POST"])
 def api_admin_cancel_orphans():
-    """Cancel orders that have no matching open position (orphans)."""
     if not agent_authed():
         return jsonify({"error": "unauthorized"}), 401
     try:
@@ -2187,8 +1823,6 @@ def api_close(sym):
 def index():
     return DASHBOARD_HTML
 
-
-# ── DASHBOARD HTML — clean rebuild ──────────────────────────────────────────
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2386,4 +2020,350 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
       <div class="btns">
         <button class="btn bp" id="btn-pause"  onclick="ctrl('pause')">⏸  PAUSE BOT</button>
         <button class="btn br" id="btn-resume" onclick="ctrl('resume')" disabled>▶  RESUME BOT</button>
-        <button class="btn bs" onclick="showModal()">🛑  EMERGE
+        <button class="btn bs" onclick="showModal()">🛑  EMERGENCY STOP</button>
+      </div>
+      <div class="note">
+        <b style="color:var(--text)">PAUSE</b> stops new trades, holds positions<br>
+        <b style="color:var(--text)">EMERGENCY STOP</b> cancels orders + closes positions
+      </div>
+    </div>
+  </div>
+
+  <div class="g21">
+    <div class="card">
+      <div class="ct">Live Bot Activity</div>
+      <div class="logbox" id="logbox">
+        <div class="li info"><span class="lt">--:--</span><span class="lm">Connecting…</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ct">Today's Trades</div>
+      <div id="trades-panel"><div class="empty">No trades today</div></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:12px">
+    <div class="ct">Open Orders</div>
+    <table>
+      <thead><tr><th>Sym</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th></tr></thead>
+      <tbody id="ord-tb"><tr><td colspan="5" class="empty">No open orders</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal" id="modal">
+  <div class="mbox">
+    <h3>🛑 Emergency Stop?</h3>
+    <p>This cancels ALL orders and closes ALL positions instantly.</p>
+    <div class="mbtns">
+      <button class="btn" style="flex:1;background:rgba(255,255,255,.04);color:var(--dim);border-color:var(--bdr)" onclick="closeModal()">CANCEL</button>
+      <button class="btn bs" style="flex:1" onclick="doStop()">CONFIRM STOP</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── helpers ────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const pw = () => $('pw').value.trim();
+const fmt = n => { const v = parseFloat(n||0); return (v>=0?'+':'') + '$' + Math.abs(v).toFixed(2); };
+const fv = n => '$' + parseFloat(n||0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+const pc = v => parseFloat(v||0) >= 0 ? 'g' : 'r';
+
+async function api(url, method='GET', body=null) {
+  try {
+    const r = await fetch(url, {
+      method,
+      headers: {'Content-Type':'application/json', 'X-Token': pw()},
+      body: body ? JSON.stringify(body) : null
+    });
+    return await r.json();
+  } catch(e) {
+    console.error('api err', url, e);
+    return null;
+  }
+}
+
+// ── clock ──────────────────────────────────────────────────────
+function tickClock() {
+  try {
+    const t = new Intl.DateTimeFormat('en-US', {
+      timeZone:'America/New_York', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+    }).format(new Date());
+    $('clk').textContent = t + ' ET';
+  } catch(e) {}
+}
+setInterval(tickClock, 1000); tickClock();
+
+// ── modal ──────────────────────────────────────────────────────
+function showModal() { $('modal').classList.add('show'); }
+function closeModal() { $('modal').classList.remove('show'); }
+
+// ── controls ───────────────────────────────────────────────────
+async function ctrl(action) {
+  if (!pw()) { alert('Enter dashboard password first'); return; }
+  const r = await api('/api/' + action, 'POST');
+  if (!r || r.error) { alert('Error: ' + (r && r.error || 'request failed')); return; }
+  setTimeout(loadData, 500);
+}
+async function doStop() {
+  closeModal();
+  if (!pw()) { alert('Enter password first'); return; }
+  const r = await api('/api/estop', 'POST');
+  if (!r || r.error) { alert('Error: ' + (r && r.error || 'request failed')); return; }
+  setTimeout(loadData, 500);
+}
+async function closePos(sym) {
+  if (!confirm('Close position: ' + sym + '?')) return;
+  if (!pw()) { alert('Enter password first'); return; }
+  await api('/api/close/' + sym, 'POST');
+  setTimeout(loadData, 500);
+}
+
+// ── render data ────────────────────────────────────────────────
+function renderData(d) {
+  if (!d || !d.ok) {
+    console.warn('bad data', d);
+    return;
+  }
+
+  // Mode badge
+  const mode = $('mode');
+  if (d.live_mode) {
+    mode.textContent = '🔴 LIVE';
+    mode.className = 'mode live';
+  } else {
+    mode.textContent = '📝 PAPER';
+    mode.className = 'mode paper';
+  }
+
+  // Health bar
+  const h = d.health || {};
+  $('h-ok').textContent   = h.last_alpaca_ok || '—';
+  $('h-scan').textContent = h.last_scan_at || '—';
+  $('h-calls').textContent = h.alpaca_call_count || 0;
+  const errs = h.alpaca_err_count || 0;
+  const errEl = $('h-errs');
+  errEl.textContent = errs;
+  errEl.className = errs > 5 ? 'err' : 'ok';
+  $('h-snap').textContent = (d.snapshot_age_s != null) ? d.snapshot_age_s.toFixed(1) + 's ago' : '—';
+
+  // Portfolio
+  $('equity').textContent = fv(d.equity);
+  const pv = parseFloat(d.pnl || 0);
+  $('pnl-sub').innerHTML = 'Today: <span class="' + pc(pv) + '">' + fmt(pv) + '</span>';
+
+  // P&L
+  const dpv = parseFloat(d.daily_pnl || 0);
+  const dpEl = $('dpnl');
+  dpEl.textContent = fmt(dpv);
+  dpEl.className = 'sv ' + (dpv >= 0 ? 'g' : 'r');
+  const gp = Math.min(100, Math.max(0, dpv / (d.goal || 100) * 100));
+  $('gfill').style.width = gp + '%';
+  $('goal-lbl').textContent = '$' + (d.goal || 100) + ' goal';
+
+  // P&L Periods (Daily / Weekly / Monthly / Yearly)
+  const pp = d.period_pnl || {};
+  const renderPeriod = (idVal, idPct, val, pct) => {
+    const valEl = $(idVal);
+    const pctEl = $(idPct);
+    if (val === undefined || val === null) {
+      valEl.textContent = '—';
+      pctEl.textContent = '—';
+      valEl.className = 'pval';
+      pctEl.className = 'ppct';
+      return;
+    }
+    const v = parseFloat(val) || 0;
+    const p = parseFloat(pct) || 0;
+    valEl.textContent = (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2);
+    pctEl.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
+    const cls = v >= 0 ? 'g' : 'r';
+    valEl.className = 'pval ' + cls;
+    pctEl.className = 'ppct ' + cls;
+  };
+  renderPeriod('pp-day',   'pp-day-pct',   pp.daily,   pp.daily_pct);
+  renderPeriod('pp-week',  'pp-week-pct',  pp.weekly,  pp.weekly_pct);
+  renderPeriod('pp-month', 'pp-month-pct', pp.monthly, pp.monthly_pct);
+  renderPeriod('pp-year',  'pp-year-pct',  pp.yearly,  pp.yearly_pct);
+
+  // W/L
+  $('wl').textContent = (d.wins || 0) + 'W / ' + (d.losses || 0) + 'L';
+  $('wr-sub').textContent = 'All-time win rate: ' + (d.win_rate || 0) + '%';
+
+  // Day trades
+  const dtEl = $('dt');
+  const dtSub = $('dt-sub');
+  dtEl.textContent = (d.dt_used || 0) + ' / ' + (d.dt_max || 2);
+  dtEl.className = 'sv ' + ((d.dt_used || 0) >= (d.dt_max || 2) ? 'r' : 'g');
+  if (d.pdt_flagged) {
+    dtSub.textContent = '⚠️ PDT FLAGGED — swing only at limit';
+    dtSub.style.color = 'var(--yellow)';
+  } else if ((d.dt_used || 0) >= (d.dt_max || 2)) {
+    dtSub.textContent = 'Limit reached — swing only';
+    dtSub.style.color = 'var(--yellow)';
+  } else {
+    dtSub.textContent = 'Max ' + (d.dt_max || 2) + ' day trades';
+    dtSub.style.color = '';
+  }
+
+  // Market
+  const mb = $('mbadge');
+  if (d.market_open) {
+    mb.className = 'mbadge open';
+    mb.textContent = 'MARKET OPEN';
+  } else {
+    mb.className = 'mbadge closed';
+    let txt = 'MARKET CLOSED';
+    if (d.next_open) {
+      try {
+        const no = new Date(d.next_open).toLocaleString('en-US',
+          {timeZone:'America/New_York', weekday:'short', hour:'2-digit', minute:'2-digit'});
+        txt = 'Opens ' + no;
+      } catch(e) {}
+    }
+    mb.textContent = txt;
+  }
+
+  // Bot status
+  const dot = $('sdot');
+  const st = $('stxt');
+  const bp = $('btn-pause');
+  const br = $('btn-resume');
+  if (d.e_stop) {
+    dot.className = 'dot stp'; st.className = 'stxt r'; st.textContent = 'EMERGENCY STOP';
+    bp.disabled = true; br.disabled = false;
+  } else if (d.paused) {
+    dot.className = 'dot psd'; st.className = 'stxt w'; st.textContent = 'PAUSED';
+    bp.disabled = true; br.disabled = false;
+  } else {
+    dot.className = 'dot run'; st.className = 'stxt g'; st.textContent = 'RUNNING';
+    bp.disabled = false; br.disabled = true;
+  }
+
+  // Positions
+  const pt = $('pos-tb');
+  const positions = d.positions || [];
+  if (positions.length === 0) {
+    pt.innerHTML = '<tr><td colspan="7" class="empty">No open positions</td></tr>';
+  } else {
+    pt.innerHTML = positions.map(p => {
+      const ent = parseFloat(p.avg_entry_price || 0).toFixed(2);
+      const cur = parseFloat(p.current_price || 0).toFixed(2);
+      const upl = parseFloat(p.unrealized_pl || 0);
+      const upc = parseFloat(p.unrealized_plpc || 0) * 100;
+      return '<tr>' +
+        '<td><b>' + (p.symbol || '') + '</b></td>' +
+        '<td class="' + (p.side === 'long' ? 'g' : 'r') + '">' + (p.side || '').toUpperCase() + '</td>' +
+        '<td>' + (p.qty || '') + '</td>' +
+        '<td>$' + ent + '</td>' +
+        '<td>$' + cur + '</td>' +
+        '<td class="' + pc(upl) + '">' + fmt(upl) + ' (' + upc.toFixed(1) + '%)</td>' +
+        '<td><button class="cbtn" onclick="closePos(\'' + p.symbol + '\')">CLOSE</button></td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  // Orders
+  const ot = $('ord-tb');
+  const orders = d.orders || [];
+  if (orders.length === 0) {
+    ot.innerHTML = '<tr><td colspan="5" class="empty">No open orders</td></tr>';
+  } else {
+    ot.innerHTML = orders.map(o =>
+      '<tr>' +
+      '<td><b>' + (o.symbol || '') + '</b></td>' +
+      '<td class="' + (o.side === 'buy' ? 'g' : 'r') + '">' + (o.side || '').toUpperCase() + '</td>' +
+      '<td>' + (o.qty || '') + '</td>' +
+      '<td>' + (o.type || '').toUpperCase() + '</td>' +
+      '<td>' + (o.status || '') + '</td>' +
+      '</tr>'
+    ).join('');
+  }
+
+  // Trades
+  const tp = $('trades-panel');
+  const trades = d.trades || [];
+  if (trades.length === 0) {
+    tp.innerHTML = '<div class="empty">No trades today</div>';
+  } else {
+    tp.innerHTML = trades.map(t => {
+      const cls = t.side === 'buy' ? 'b' : 's';
+      const tm = (t.time || '').slice(11, 19);
+      return '<div class="trade-row">' +
+        '<span><span class="bn ' + cls + '">' + (t.side || '').toUpperCase() + '</span> <b>' + t.sym + '</b></span>' +
+        '<span>' + t.qty + ' @ $' + parseFloat(t.price || 0).toFixed(2) + '</span>' +
+        '<span style="color:var(--dim);font-size:10px">' + tm + '</span>' +
+      '</div>';
+    }).join('');
+  }
+}
+
+async function loadData() {
+  const d = await api('/api/data');
+  renderData(d);
+}
+
+async function loadLogs() {
+  const r = await api('/api/logs');
+  if (!r || !r.lines) return;
+  const box = $('logbox');
+  box.innerHTML = r.lines.slice().reverse().map(line => {
+    let cls = 'info';
+    if (/WIN|profit|✅/.test(line)) cls = 'success';
+    else if (/LOSS|failed|❌/.test(line)) cls = 'error';
+    else if (/⚠️|PDT|BLOCKED|🐋|🚨/.test(line)) cls = 'warning';
+    const tm = line.match(/([0-9]{2}:[0-9]{2}):[0-9]{2}/);
+    const t = tm ? tm[1] : '';
+    const msg = line.replace(/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},?[0-9]* /, '');
+    return '<div class="li ' + cls + '"><span class="lt">' + t + '</span><span class="lm">' + msg + '</span></div>';
+  }).join('');
+}
+
+// ── start ──────────────────────────────────────────────────────
+loadData();
+loadLogs();
+
+// Polling intervals
+let dataInterval = setInterval(loadData, 2000);
+let logsInterval = setInterval(loadLogs, 5000);
+
+// Visibility-aware refresh: when tab becomes visible (user switches back
+// to it, unlocks phone, etc), immediately refresh and resume polling.
+// Fixes mobile browser timer throttling — without this, you'd see stale
+// data after locking your phone for a few minutes.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    // Force immediate refresh when page becomes visible
+    loadData();
+    loadLogs();
+  }
+});
+
+// Pulse the LIVE indicator each time fresh data arrives
+const origRender = renderData;
+renderData = function(d) {
+  origRender(d);
+  // Briefly flash the snapshot age indicator green to show fresh data
+  const snap = $('h-snap');
+  if (snap) {
+    snap.style.transition = 'color 0.15s';
+    snap.style.color = 'var(--green)';
+    setTimeout(() => { snap.style.color = ''; }, 200);
+  }
+};
+</script>
+</body>
+</html>
+"""
+
+def start_threads():
+    threading.Thread(target=snapshot_loop, daemon=True, name="snapshot").start()
+    threading.Thread(target=keepalive_loop, daemon=True, name="keepalive").start()
+    threading.Thread(target=bot_loop, daemon=True, name="bot").start()
+    log.info("🤖 Threads started")
+
+start_threads()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
