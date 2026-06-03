@@ -23,6 +23,10 @@ TARGET_PCT   = float(os.environ.get("TARGET_PCT",   "0.07"))
 MIN_SCORE    = int(os.environ.get("MIN_SCORE",      "55"))
 MIN_PRICE    = float(os.environ.get("MIN_PRICE",    "10.0"))
 BEAR_MIN_PRICE = float(os.environ.get("BEAR_MIN_PRICE", "3.0"))
+
+SHORT_CHECK_ENABLED = os.environ.get("SHORT_CHECK_ENABLED", "true").lower() == "true"
+MIN_RVOL            = float(os.environ.get("MIN_RVOL", "0.5"))
+AGENT_RETRIES       = int(os.environ.get("AGENT_RETRIES", "2"))
 MAX_DT       = int(os.environ.get("MAX_DAY_TRADES", "2"))
 MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 
@@ -596,6 +600,13 @@ def _et_today_at(hour, minute):
 def _iso_utc(dt):
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def session_fraction():
+    now = datetime.now(ET)
+    open_et, close_et = _et_today_at(9, 30), _et_today_at(16, 0)
+    if now <= open_et:  return 0.0
+    if now >= close_et: return 1.0
+    return (now - open_et).total_seconds() / (close_et - open_et).total_seconds()
+
 def get_scan_minute_bars(sym, timeout=8):
     now = datetime.now(ET)
     open_et = _et_today_at(9, 30)
@@ -760,6 +771,12 @@ def scan_one(sym, healthy, tsize):
             sc = min(100, sc + NEWS_BOOST)
         vr  = d.get("v", 0) / max(p.get("v", 1), 1)
         chg = (cur - pc) / pc
+        if MIN_RVOL > 0:
+            rvol = vr / max(session_fraction(), 0.1)
+            if rvol < MIN_RVOL:
+                log.debug(f"skip {sym}: low RVOL {rvol:.2f} (vr {vr:.2f}, "
+                          f"{session_fraction()*100:.0f}% of session elapsed)")
+                return None
         tier, _ = whale_tier(snap)
         shares = int(tsize / cur)
         if shares < 1:
@@ -1010,17 +1027,45 @@ def ask_agent(setup, swing=False):
         if AGENT_AUTH_TOKEN:
             headers["X-Auth-Token"] = AGENT_AUTH_TOKEN
 
-        r = requests.post(f"{AGENT_URL}/evaluate", json=payload,
-                          headers=headers, timeout=AGENT_TIMEOUT_S)
-        if r.status_code != 200:
-            log.warning(f"Agent returned {r.status_code}: {r.text[:200]}")
-            return {"decision": "APPROVE", "reasoning": f"agent {r.status_code} — fallback",
-                    "confidence": 0.5, "agent_failed": True}
-        return r.json()
+        r = None
+        for attempt in range(AGENT_RETRIES + 1):
+            r = requests.post(f"{AGENT_URL}/evaluate", json=payload,
+                              headers=headers, timeout=AGENT_TIMEOUT_S)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < AGENT_RETRIES:
+                try:
+                    wait = min((float(r.headers.get("Retry-After", 0)) or (0.5 * (2 ** attempt))), 3.0)
+                except Exception:
+                    wait = 0.5 * (2 ** attempt)
+                log.warning(f"Agent {r.status_code} — retry {attempt+1}/{AGENT_RETRIES} in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            break
+        log.warning(f"Agent returned {r.status_code}: {r.text[:200]}")
+        return {"decision": "APPROVE", "reasoning": f"agent {r.status_code} — fallback",
+                "confidence": 0.5, "agent_failed": True}
     except Exception as e:
         log.warning(f"Agent call failed: {e}")
         return {"decision": "APPROVE", "reasoning": f"agent error: {e} — fallback",
                 "confidence": 0.5, "agent_failed": True}
+
+_shortable_cache = {}
+
+def is_shortable(sym):
+    if not SHORT_CHECK_ENABLED:
+        return True
+    hit = _shortable_cache.get(sym)
+    if hit and (time.time() - hit[1]) < 600:
+        return hit[0]
+    try:
+        a = aGet(f"/v2/assets/{sym}")
+        ok = bool(a.get("tradable", True)) and bool(a.get("shortable")) and bool(a.get("easy_to_borrow"))
+    except Exception as e:
+        log.debug(f"shortable check {sym}: {e}")
+        ok = False
+    _shortable_cache[sym] = (ok, time.time())
+    return ok
 
 def place_order(setup, swing=False):
     side = "buy" if setup["dir"] == "LONG" else "sell"
@@ -1138,6 +1183,9 @@ def execute(setups, label=""):
         reason = is_blocked(s["sym"])
         if reason:
             log.debug(f"Skip {s['sym']}: {reason}")
+            continue
+        if s["dir"] == "SHORT" and not is_shortable(s["sym"]):
+            push_alert(f"⏭️ Skip short {s['sym']}: not shortable / no borrow available", "info")
             continue
         filtered.append(s)
 
@@ -1439,12 +1487,14 @@ def keepalive_loop():
     while True:
         try:
             if KEEPALIVE:
-                requests.get(KEEPALIVE, timeout=10)
-                push_alert("💓 Keepalive ping sent", "info")
+                url = KEEPALIVE.rstrip("/") + "/api/health"
+                r = requests.get(url, timeout=20)
+                push_alert(f"💓 Keepalive ping ({r.status_code})", "info")
             else:
-                push_alert("💓 Bot heartbeat (no keepalive URL configured)", "info")
+                push_alert("💓 Bot heartbeat (no RENDER_EXTERNAL_URL set)", "info")
         except Exception as e:
-            push_alert(f"⚠️ Keepalive failed: {e}", "warning")
+            host = (KEEPALIVE or "")[:60]
+            push_alert(f"⚠️ Keepalive failed ({type(e).__name__}) to {host} — non-critical", "warning")
         time.sleep(270)
 
 def snapshot_loop():
