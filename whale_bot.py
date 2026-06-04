@@ -28,6 +28,7 @@ BEAR_MIN_PRICE = float(os.environ.get("BEAR_MIN_PRICE", "3.0"))
 SHORT_CHECK_ENABLED = os.environ.get("SHORT_CHECK_ENABLED", "true").lower() == "true"
 MIN_RVOL            = float(os.environ.get("MIN_RVOL", "0.5"))
 AGENT_RETRIES       = int(os.environ.get("AGENT_RETRIES", "2"))
+AGENT_CACHE_SEC     = int(os.environ.get("AGENT_CACHE_SEC", "300"))
 MAX_DT       = int(os.environ.get("MAX_DAY_TRADES", "2"))
 MAX_RISK_PCT = float(os.environ.get("MAX_RISK_PCT", "0.01"))
 
@@ -994,7 +995,22 @@ def premarket_scan():
     else:
         push_alert("🌅 Premarket scan — no qualifying gappers", "info")
 
+_agent_cache = {}
 def ask_agent(setup, swing=False):
+    if not AGENT_URL:
+        return {"decision": "APPROVE", "reasoning": "agent not configured",
+                "confidence": 1.0, "skipped": True}
+    key = (setup["sym"], setup["dir"], bool(swing))
+    now = time.time()
+    hit = _agent_cache.get(key)
+    if hit and now - hit[1] < AGENT_CACHE_SEC:
+        cached = dict(hit[0]); cached["cached"] = True
+        return cached
+    result = _ask_agent_uncached(setup, swing)
+    _agent_cache[key] = (result, now)
+    return result
+
+def _ask_agent_uncached(setup, swing=False):
     if not AGENT_URL:
         return {"decision": "APPROVE", "reasoning": "agent not configured",
                 "confidence": 1.0, "skipped": True}
@@ -1428,7 +1444,7 @@ def job(label):
 
 def bot_loop():
     restore_alerts()
-    push_alert(f"🐋 Whale Bot v5 online — {'🔴 LIVE' if LIVE_MODE else '📝 PAPER'}", "success")
+    push_alert(f"🐋 Whale Bot v6 online — {'🔴 LIVE' if LIVE_MODE else '📝 PAPER'}", "success")
     push_alert(f"Watching {len(TICKERS)} tickers | ${TRADE_SIZE}/trade | "
                f"min ${MIN_PRICE} | min score {MIN_SCORE}", "info")
 
@@ -2009,7 +2025,7 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
 
 <div class="hdr">
   <div class="logo">
-    🐋 WHALE BOT <span class="v">v5</span>
+    🐋 WHALE BOT <span class="v">v6</span>
     <span id="mode" class="mode paper">PAPER</span>
   </div>
   <div class="hdr-r">
