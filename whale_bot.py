@@ -1,3 +1,4 @@
+
 import os, json, time, logging, threading, traceback
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1067,6 +1068,27 @@ def is_shortable(sym):
     _shortable_cache[sym] = (ok, time.time())
     return ok
 
+_acct_short = {"can": None, "ts": 0.0, "warned": 0.0}
+def account_can_short():
+    if not SHORT_CHECK_ENABLED:
+        return True
+    now = time.time()
+    if _acct_short["can"] is not None and now - _acct_short["ts"] < 600:
+        return _acct_short["can"]
+    can = True
+    try:
+        a = get_account()
+        shorting = bool(a.get("shorting_enabled", True))
+        mult = float(a.get("multiplier", "1") or 1)
+        blocked = bool(a.get("account_blocked")) or bool(a.get("trading_blocked"))
+        can = shorting and mult >= 2 and not blocked
+    except Exception as e:
+        log.debug(f"account short check: {e}")
+        can = True
+    _acct_short["can"] = can
+    _acct_short["ts"] = now
+    return can
+
 def place_order(setup, swing=False):
     side = "buy" if setup["dir"] == "LONG" else "sell"
     body = {
@@ -1184,9 +1206,17 @@ def execute(setups, label=""):
         if reason:
             log.debug(f"Skip {s['sym']}: {reason}")
             continue
-        if s["dir"] == "SHORT" and not is_shortable(s["sym"]):
-            push_alert(f"⏭️ Skip short {s['sym']}: not shortable / no borrow available", "info")
-            continue
+        if s["dir"] == "SHORT":
+            if not account_can_short():
+                if time.time() - _acct_short["warned"] > 600:
+                    push_alert("⚠️ Account has shorting disabled (cash/no-margin) — "
+                               "skipping all SHORT setups. Enable margin on Alpaca, "
+                               "or trade inverse ETFs (SQQQ/SPXS) long instead.", "warning")
+                    _acct_short["warned"] = time.time()
+                continue
+            if not is_shortable(s["sym"]):
+                push_alert(f"⏭️ Skip short {s['sym']}: not shortable / no borrow available", "info")
+                continue
         filtered.append(s)
 
     if not filtered:
