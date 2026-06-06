@@ -1388,37 +1388,53 @@ def protect_positions():
                 sl_price = round(entry * (1 + STOP_PCT), 2)
                 tp_price = round(entry * (1 - TARGET_PCT), 2)
 
-            cancelled = 0
+            cancelled_ids = []
             for o in existing["all_close"]:
                 if o["side"] != close_side:
                     continue
                 try:
                     aDel(f"/v2/orders/{o['id']}")
-                    cancelled += 1
+                    cancelled_ids.append(o["id"])
                 except Exception as e:
                     log.debug(f"cancel {o['id']}: {e}")
 
-            if cancelled:
-                push_alert(f"🧹 Cancelled {cancelled} solo close order(s) for {sym} to place OCO", "info")
-                time.sleep(0.5)
+            if cancelled_ids:
+                push_alert(f"🧹 Cancelled {len(cancelled_ids)} solo close order(s) for {sym} to place OCO", "info")
+                for _ in range(10):
+                    time.sleep(0.5)
+                    try:
+                        still_open = {oo.get("id") for oo in get_orders_open()}
+                    except Exception:
+                        break
+                    if not (set(cancelled_ids) & still_open):
+                        break
 
-            try:
-                aPost("/v2/orders", {
-                    "symbol": sym,
-                    "qty": str(qty),
-                    "side": close_side,
-                    "type": "limit",
-                    "limit_price": str(tp_price),
-                    "time_in_force": "gtc",
-                    "order_class": "oco",
-                    "stop_loss":   {"stop_price":  str(sl_price)},
-                    "take_profit": {"limit_price": str(tp_price)},
-                })
-                push_alert(
-                    f"🛡️ OCO protection for {sym}: {close_side.upper()} {qty} | "
-                    f"SL ${sl_price} / TP ${tp_price} GTC", "warning")
-            except Exception as e:
-                push_alert(f"⚠️ Failed to place OCO for {sym}: {e}", "error")
+            placed = False
+            for attempt in range(3):
+                try:
+                    aPost("/v2/orders", {
+                        "symbol": sym,
+                        "qty": str(qty),
+                        "side": close_side,
+                        "type": "limit",
+                        "limit_price": str(tp_price),
+                        "time_in_force": "gtc",
+                        "order_class": "oco",
+                        "stop_loss":   {"stop_price":  str(sl_price)},
+                        "take_profit": {"limit_price": str(tp_price)},
+                    })
+                    push_alert(
+                        f"🛡️ OCO protection for {sym}: {close_side.upper()} {qty} | "
+                        f"SL ${sl_price} / TP ${tp_price} GTC", "warning")
+                    placed = True
+                    break
+                except Exception as e:
+                    if "403" in str(e) and attempt < 2:
+                        time.sleep(1.0 * (attempt + 1))
+                        continue
+                    push_alert(f"🚨 Failed to place OCO for {sym} — position UNPROTECTED, "
+                               f"will retry next cycle: {e}", "error")
+                    break
 
     except Exception as e:
         push_alert(f"⚠️ protect_positions error: {e}", "error")
