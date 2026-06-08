@@ -27,6 +27,8 @@ BEAR_MIN_PRICE = float(os.environ.get("BEAR_MIN_PRICE", "3.0"))
 
 SHORT_CHECK_ENABLED = os.environ.get("SHORT_CHECK_ENABLED", "true").lower() == "true"
 MIN_RVOL            = float(os.environ.get("MIN_RVOL", "0.5"))
+MAX_SPREAD_PCT      = float(os.environ.get("MAX_SPREAD_PCT", "0.005"))
+VOL_FEED            = os.environ.get("VOL_FEED", "delayed_sip")
 AGENT_RETRIES       = int(os.environ.get("AGENT_RETRIES", "2"))
 AGENT_CACHE_SEC     = int(os.environ.get("AGENT_CACHE_SEC", "300"))
 MAX_DT       = int(os.environ.get("MAX_DAY_TRADES", "2"))
@@ -737,6 +739,31 @@ def score_ticker(sym, snap, dbars, mbars, healthy=True):
     if not healthy:  score = int(score * 0.8)
     return min(score, 100), direction
 
+_vol_cache = {}
+
+def accurate_daily_vol(sym):
+    if VOL_FEED == "iex":
+        return None
+    now = time.time()
+    hit = _vol_cache.get(sym)
+    if hit and now - hit[1] < 60:
+        return hit[0]
+    try:
+        bars = aGet(f"/v2/stocks/{sym}/bars",
+                    {"timeframe": "1Day", "limit": 2, "feed": VOL_FEED},
+                    DATA_URL, timeout=8).get("bars", [])
+        if len(bars) < 2:
+            return None
+        today_v = float(bars[-1].get("v", 0))
+        prev_v  = float(bars[-2].get("v", 0))
+        if today_v <= 0 or prev_v <= 0:
+            return None
+        _vol_cache[sym] = ((today_v, prev_v), now)
+        return today_v, prev_v
+    except Exception as e:
+        log.debug(f"accurate_daily_vol {sym}: {e}")
+        return None
+
 def scan_one(sym, healthy, tsize):
     try:
         snap = aGet(f"/v2/stocks/{sym}/snapshot", base=DATA_URL, timeout=8)
@@ -750,6 +777,16 @@ def scan_one(sym, healthy, tsize):
         price_floor = BEAR_MIN_PRICE if sym in BEAR_TICKERS else MIN_PRICE
         if cur < price_floor or not pc:
             return None
+        if MAX_SPREAD_PCT > 0:
+            q = snap.get("latestQuote", {})
+            bid, ask = q.get("bp", 0), q.get("ap", 0)
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2
+                spread = (ask - bid) / mid if mid > 0 else 0
+                if spread > MAX_SPREAD_PCT:
+                    log.debug(f"skip {sym}: spread {spread*100:.2f}% > "
+                              f"cap {MAX_SPREAD_PCT*100:.2f}%")
+                    return None
         if sym not in TICKERS:
             chg0 = (cur - pc) / pc
             if abs(chg0) > DISCOVERED_MAX_CHG:
@@ -771,7 +808,12 @@ def scan_one(sym, healthy, tsize):
             return None
         if news["fresh"]:
             sc = min(100, sc + NEWS_BOOST)
-        vr  = d.get("v", 0) / max(p.get("v", 1), 1)
+        av = accurate_daily_vol(sym)
+        if av:
+            tv, pv = av
+            vr = tv / max(pv, 1)
+        else:
+            vr = d.get("v", 0) / max(p.get("v", 1), 1)
         chg = (cur - pc) / pc
         if MIN_RVOL > 0:
             rvol = vr / max(session_fraction(), 0.1)
@@ -1350,12 +1392,15 @@ def protect_positions():
         for o in open_orders:
             sym = o.get("symbol", "")
             otype = (o.get("order_type") or o.get("type") or "").lower()
+            oclass = (o.get("order_class") or "").lower()
             oside = o.get("side", "")
             oid = o.get("id", "")
             if not sym or not oid:
                 continue
-            d = by_sym.setdefault(sym, {"stops": [], "limits": [], "all_close": []})
+            d = by_sym.setdefault(sym, {"stops": [], "limits": [], "all_close": [], "oco": False})
             d["all_close"].append({"id": oid, "side": oside, "type": otype})
+            if oclass in ("oco", "bracket", "oto"):
+                d["oco"] = True
             if "stop" in otype:
                 d["stops"].append(oid)
             elif "limit" in otype:
@@ -1372,11 +1417,12 @@ def protect_positions():
             if qty == 0 or entry <= 0:
                 continue
 
-            existing = by_sym.get(sym, {"stops": [], "limits": [], "all_close": []})
+            existing = by_sym.get(sym, {"stops": [], "limits": [], "all_close": [], "oco": False})
             has_stop = len(existing["stops"]) > 0
             has_limit = len(existing["limits"]) > 0
+            has_oco  = existing.get("oco", False)
 
-            if has_stop and has_limit:
+            if has_oco or (has_stop and has_limit):
                 continue
 
             close_side = "sell" if side == "long" else "buy"
@@ -1742,6 +1788,8 @@ def api_debug():
                 "MOVERS_MIN_CHG": MOVERS_MIN_CHG,
                 "DISCOVERED_MAX_CHG": DISCOVERED_MAX_CHG,
                 "DISCOVERED_MIN_DVOL": DISCOVERED_MIN_DVOL,
+                "MAX_SPREAD_PCT": MAX_SPREAD_PCT,
+                "VOL_FEED": VOL_FEED,
                 "NEWS_LAYER_ENABLED": NEWS_LAYER_ENABLED,
                 "NEWS_REQUIRED": NEWS_REQUIRED,
                 "NEWS_BOOST": NEWS_BOOST,
