@@ -19,6 +19,7 @@ TRADE_SIZE   = float(os.environ.get("TRADE_SIZE",   "25"))
 MAX_POSITION = float(os.environ.get("MAX_POSITION", "1000000"))
 DAILY_GOAL   = float(os.environ.get("DAILY_GOAL",   "100"))
 MAX_LOSS     = float(os.environ.get("MAX_LOSS",     "25"))
+LOCK_IN_AT_GOAL = os.environ.get("LOCK_IN_AT_GOAL", "false").lower() == "true"
 STOP_PCT     = float(os.environ.get("STOP_PCT",     "0.05"))
 TARGET_PCT   = float(os.environ.get("TARGET_PCT",   "0.07"))
 MIN_SCORE    = int(os.environ.get("MIN_SCORE",      "55"))
@@ -123,6 +124,8 @@ _state = {
     "gap_candidates": {},
     "traded_today": [],
     "lost_today": [],
+    "halted_today": False,
+    "halt_reason": "",
     "bot_dt_count": 0,
     "completed_trades_today": 0,
     "sym_cooldown": {},
@@ -231,6 +234,16 @@ def aDel(path, timeout=10):
         raise
 
 def get_account():    return aGet("/v2/account")
+
+def day_pnl():
+    try:
+        a = get_account()
+        eq = float(a.get("equity", 0))
+        leq = float(a.get("last_equity", eq))
+        return eq - leq
+    except Exception as e:
+        log.debug(f"day_pnl: {e}")
+        return None
 def get_positions():  return aGet("/v2/positions")
 def get_orders_open(): return aGet("/v2/orders", {"status": "open", "limit": 50})
 def get_clock():      return aGet("/v2/clock")
@@ -1198,6 +1211,8 @@ def reset_if_new_day():
             })
             _state["traded_today"] = []
             _state["lost_today"]   = []
+            _state["halted_today"] = False
+            _state["halt_reason"]  = ""
             _state["news_tickers"] = []
             _state["mover_tickers"] = []
             _state["gap_candidates"] = {}
@@ -1228,6 +1243,27 @@ def execute(setups, label=""):
         push_alert(
             f"🛑 Daily trade cap reached ({completed}/{MAX_TRADES_PER_DAY}) — "
             f"no new trades today. Bot will resume tomorrow.", "warning")
+        return
+
+    with _lock:
+        halted = _state.get("halted_today", False)
+        reason = _state.get("halt_reason", "")
+    if not halted and (MAX_LOSS > 0 or (DAILY_GOAL > 0 and LOCK_IN_AT_GOAL)):
+        pnl = day_pnl()
+        if pnl is not None:
+            trip = None
+            if MAX_LOSS > 0 and pnl <= -abs(MAX_LOSS):
+                trip = f"daily loss limit (P&L {pnl:+.2f} ≤ -{abs(MAX_LOSS):.0f})"
+            elif DAILY_GOAL > 0 and LOCK_IN_AT_GOAL and pnl >= DAILY_GOAL:
+                trip = f"daily goal reached (P&L {pnl:+.2f} ≥ {DAILY_GOAL:.0f})"
+            if trip:
+                with _lock:
+                    _state["halted_today"] = True
+                    _state["halt_reason"]  = trip
+                halted, reason = True, trip
+                push_alert(f"🛑 Session halted — {trip}. No new entries until "
+                           f"tomorrow's reset (Resume to override).", "warning")
+    if halted:
         return
 
     alpaca_dt = get_dt_used()
@@ -1506,7 +1542,7 @@ def job(label):
 
 def bot_loop():
     restore_alerts()
-    push_alert(f"🐋 Whale Bot v6 online — {'🔴 LIVE' if LIVE_MODE else '📝 PAPER'}", "success")
+    push_alert(f"🐋 Whale Bot v7 online — {'🔴 LIVE' if LIVE_MODE else '📝 PAPER'}", "success")
     push_alert(f"Watching {len(TICKERS)} tickers | ${TRADE_SIZE}/trade | "
                f"min ${MIN_PRICE} | min score {MIN_SCORE}", "info")
 
@@ -1707,6 +1743,7 @@ def api_data():
         "pdt_flagged":    pdt_flag,
         "trade_size":     TRADE_SIZE,
         "max_loss":       MAX_LOSS,
+        "lock_in_at_goal": LOCK_IN_AT_GOAL,
         "paused":         _state["paused"],
         "e_stop":         _state["e_stop"],
         "market_open":    clock.get("is_open", False),
@@ -1718,6 +1755,8 @@ def api_data():
         "fills_count":    len(fills),
         "traded_today":   traded,
         "lost_today":     lost,
+        "halted_today":   _state.get("halted_today", False),
+        "halt_reason":    _state.get("halt_reason", ""),
         "goal":           DAILY_GOAL,
         "period_pnl":     pp,
         "bot_dt_count":   bot_dt_count,
@@ -1819,6 +1858,8 @@ def api_resume():
     with _lock:
         _state["paused"] = False
         _state["e_stop"] = False
+        _state["halted_today"] = False
+        _state["halt_reason"]  = ""
     push_alert("▶️ Bot RESUMED", "success")
     return jsonify({"ok": True})
 
@@ -2089,7 +2130,7 @@ border:1px solid rgba(255,64,96,.3);background:rgba(255,64,96,.08);color:var(--r
 
 <div class="hdr">
   <div class="logo">
-    🐋 WHALE BOT <span class="v">v6</span>
+    🐋 WHALE BOT <span class="v">v7</span>
     <span id="mode" class="mode paper">PAPER</span>
   </div>
   <div class="hdr-r">
