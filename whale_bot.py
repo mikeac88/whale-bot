@@ -14,6 +14,7 @@ DATA_URL   = "https://data.alpaca.markets"
 DASH_PASS  = os.environ.get("DASHBOARD_PASSWORD", "whale2024")
 PORT       = int(os.environ.get("PORT", 8080))
 KEEPALIVE  = os.environ.get("RENDER_EXTERNAL_URL", "")
+KEEPALIVE_ENABLED = os.environ.get("KEEPALIVE_ENABLED", "true").lower() == "true"
 
 TRADE_SIZE   = float(os.environ.get("TRADE_SIZE",   "25"))
 MAX_POSITION = float(os.environ.get("MAX_POSITION", "1000000"))
@@ -1628,6 +1629,11 @@ def bot_loop():
 
 def keepalive_loop():
     time.sleep(120)
+    if not KEEPALIVE_ENABLED:
+        log.info("Self-keepalive OFF (KEEPALIVE_ENABLED=false): relying on an "
+                 "external market-hours pinger; service will spin down when idle "
+                 "to conserve Render free-tier hours.")
+        return
     while True:
         try:
             if KEEPALIVE:
